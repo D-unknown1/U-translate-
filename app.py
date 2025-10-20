@@ -2162,7 +2162,7 @@ class LiveTranslatorApp(QMainWindow):
             return
         src_idx = self.source_lang_combo.currentIndex()
         tgt_idx = self.target_lang_combo.currentIndex()
-        self.source_lang_combo.setCurrentIndex(tgt_idx)
+        self.source_lang_combo.setCurrentIndex(tgt_idx + 1)
         self.target_lang_combo.setCurrentIndex(src_idx - 1)
     
     def update_word_count(self):
