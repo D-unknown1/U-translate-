@@ -344,12 +344,17 @@ class WhisperModelManager:
         self.models = {}
         self.device = "cpu"
         self.use_gpu = config.get("use_gpu", True)
+        # Initialize device on startup
+        self.set_device(self.use_gpu)
     
     def set_device(self, use_gpu=True):
         self.use_gpu = use_gpu
+        old_device = self.device
         self.device = gpu_manager.get_device(use_gpu)
+        log.info(f"WhisperModelManager device set to: {self.device}")
         # Reload models if device changed
-        if self.models:
+        if old_device != self.device and self.models:
+            log.info(f"Device changed from {old_device} to {self.device}, reloading models...")
             old_models = list(self.models.keys())
             self.models.clear()
             for model_size in old_models:
@@ -361,6 +366,7 @@ class WhisperModelManager:
         try:
             log.info(f"Loading Whisper {model_size} on {self.device}...")
             self.models[model_size] = whisper.load_model(model_size, device=self.device)
+            log.info(f"Whisper {model_size} loaded successfully")
             return True
         except Exception as e:
             log.error(f"Whisper load failed: {e}")
@@ -371,16 +377,38 @@ class WhisperModelManager:
             if not self.load_model(model_size):
                 return "", 0.0
         try:
+            # Validate audio data
+            if audio_data is None or len(audio_data) == 0:
+                log.warning("Empty audio data received")
+                return "", 0.0
+            
+            # Ensure audio is float32 and normalized
             if audio_data.dtype != np.float32:
-                audio_data = audio_data.astype(np.float32) / 32768.0
+                audio_data = audio_data.astype(np.float32)
+                if np.abs(audio_data).max() > 1.0:
+                    audio_data = audio_data / 32768.0
+            
+            # Ensure minimum audio length (Whisper needs at least some samples)
+            if len(audio_data) < 400:  # ~0.025s at 16kHz
+                log.warning(f"Audio too short: {len(audio_data)} samples")
+                return "", 0.0
+            
             fp16 = self.device == "cuda"
-            result = self.models[model_size].transcribe(audio_data, language=language, task="transcribe", fp16=fp16)
+            result = self.models[model_size].transcribe(
+                audio_data, 
+                language=language, 
+                task="transcribe", 
+                fp16=fp16,
+                condition_on_previous_text=False  # Avoid issues with empty audio
+            )
             text = result.get("text", "").strip()
             segments = result.get("segments", [])
             confidence = 1.0 - (sum(s.get("no_speech_prob", 0) for s in segments) / len(segments) if segments else 0)
             return text, confidence
         except Exception as e:
             log.error(f"Whisper transcribe failed: {e}")
+            import traceback
+            log.error(traceback.format_exc())
             return "", 0.0
 
 whisper_manager = WhisperModelManager()
@@ -581,6 +609,7 @@ class ContinuousSpeechRecognitionThread(QThread):
         
         # Thread pool for parallel processing
         self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="RecognitionWorker")
+        self.executor_shutdown = False
         
         # Performance monitoring
         self.processing_times = deque(maxlen=20)
@@ -617,8 +646,10 @@ class ContinuousSpeechRecognitionThread(QThread):
                         audio = recognizer.listen(source, timeout=None, phrase_time_limit=15)
                         
                         # Async processing - submit to queue
-                        if not self.recognition_queue.full():
+                        if not self.recognition_queue.full() and not self.executor_shutdown:
                             self.executor.submit(self._process_audio, audio)
+                        elif self.executor_shutdown:
+                            break
                         else:
                             log.warning("Recognition queue full, dropping audio")
                         
@@ -628,10 +659,12 @@ class ContinuousSpeechRecognitionThread(QThread):
                     except sr.WaitTimeoutError:
                         pass
                     except Exception as e:
-                        log.warning(f"Mic error: {e}")
+                        if self.running:  # Only log if we're supposed to be running
+                            log.warning(f"Mic error: {e}")
                         time.sleep(0.5)
         except Exception as e:
-            self.error_occurred.emit(f"Microphone setup failed: {e}")
+            if self.running:
+                self.error_occurred.emit(f"Microphone setup failed: {e}")
     
     def _listen_system_audio_continuous(self):
         """Continuous system audio capture"""
@@ -692,6 +725,9 @@ class ContinuousSpeechRecognitionThread(QThread):
     
     def _process_system_audio(self, audio_data, samplerate):
         """Process system audio chunk"""
+        if not self.running or self.executor_shutdown:
+            return
+        
         start_time = time.time()
         try:
             energy = np.sqrt(np.mean(audio_data ** 2))
@@ -712,7 +748,8 @@ class ContinuousSpeechRecognitionThread(QThread):
             self.processing_times.append(elapsed)
             
         except Exception as e:
-            log.error(f"Process system audio error: {e}")
+            if self.running:
+                log.error(f"Process system audio error: {e}")
     
     def _recognize_vosk(self, wav_data):
         if not self.vosk_model:
@@ -763,6 +800,8 @@ class ContinuousSpeechRecognitionThread(QThread):
     
     def stop(self):
         self.running = False
+        self.executor_shutdown = True
+        # Shutdown executor gracefully
         self.executor.shutdown(wait=False)
 
 class ResizableOverlay(QWidget):
@@ -1026,6 +1065,418 @@ class ResizableOverlay(QWidget):
             for indicator in self.corner_indicators:
                 indicator.hide()
 
+class SettingsDialog(QDialog):
+    """Comprehensive settings dialog with all editable options"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚙️ Settings")
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(700)
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Create tab widget for organized settings
+        tabs = QTabWidget()
+        
+        # ===== GENERAL TAB =====
+        general_tab = QWidget()
+        general_layout = QVBoxLayout(general_tab)
+        
+        # Theme
+        theme_group = QGroupBox("Appearance")
+        theme_layout = QVBoxLayout()
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Dark", "Light"])
+        self.theme_combo.setCurrentText(config.get("theme", "dark").title())
+        theme_layout.addWidget(QLabel("Theme:"))
+        theme_layout.addWidget(self.theme_combo)
+        
+        # Font size
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(10, 48)
+        self.font_size_spin.setValue(config.get("font_size", 20))
+        theme_layout.addWidget(QLabel("Overlay Font Size:"))
+        theme_layout.addWidget(self.font_size_spin)
+        
+        # Text color
+        self.text_color_btn = QPushButton("Choose Text Color")
+        self.text_color = config.get("text_color", "#FFFFFF")
+        self.text_color_btn.clicked.connect(self.choose_text_color)
+        theme_layout.addWidget(QLabel("Overlay Text Color:"))
+        theme_layout.addWidget(self.text_color_btn)
+        
+        theme_group.setLayout(theme_layout)
+        general_layout.addWidget(theme_group)
+        
+        # Animation
+        anim_group = QGroupBox("Animation")
+        anim_layout = QVBoxLayout()
+        self.anim_duration_spin = QSpinBox()
+        self.anim_duration_spin.setRange(0, 1000)
+        self.anim_duration_spin.setValue(config.get("animation_duration", 200))
+        self.anim_duration_spin.setSuffix(" ms")
+        anim_layout.addWidget(QLabel("Animation Duration:"))
+        anim_layout.addWidget(self.anim_duration_spin)
+        anim_group.setLayout(anim_layout)
+        general_layout.addWidget(anim_group)
+        
+        # Max words
+        words_group = QGroupBox("Overlay Buffer")
+        words_layout = QVBoxLayout()
+        self.max_words_spin = QSpinBox()
+        self.max_words_spin.setRange(10, 500)
+        self.max_words_spin.setValue(config.get("max_words", 100))
+        words_layout.addWidget(QLabel("Maximum Words in Overlay:"))
+        words_layout.addWidget(self.max_words_spin)
+        words_group.setLayout(words_layout)
+        general_layout.addWidget(words_group)
+        
+        general_layout.addStretch()
+        tabs.addTab(general_tab, "General")
+        
+        # ===== AUDIO TAB =====
+        audio_tab = QWidget()
+        audio_layout = QVBoxLayout(audio_tab)
+        
+        # TTS Settings
+        tts_group = QGroupBox("Text-to-Speech")
+        tts_layout = QVBoxLayout()
+        
+        self.tts_rate_spin = QSpinBox()
+        self.tts_rate_spin.setRange(50, 300)
+        self.tts_rate_spin.setValue(config.get("tts_rate", 150))
+        tts_layout.addWidget(QLabel("Speech Rate:"))
+        tts_layout.addWidget(self.tts_rate_spin)
+        
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(int(config.get("volume", 0.8) * 100))
+        self.volume_label = QLabel(f"{self.volume_slider.value()}%")
+        self.volume_slider.valueChanged.connect(lambda v: self.volume_label.setText(f"{v}%"))
+        tts_layout.addWidget(QLabel("Volume:"))
+        tts_layout.addWidget(self.volume_slider)
+        tts_layout.addWidget(self.volume_label)
+        
+        tts_group.setLayout(tts_layout)
+        audio_layout.addWidget(tts_group)
+        
+        # Audio Device
+        device_group = QGroupBox("Audio Input Device")
+        device_layout = QVBoxLayout()
+        self.device_combo = QComboBox()
+        self.device_combo.addItem("Default", "default")
+        for device in audio_device_manager.input_devices:
+            self.device_combo.addItem(f"{device.name} ({device.host_api})", str(device.index))
+        current_device = config.get("audio_device_input", "default")
+        idx = self.device_combo.findData(current_device)
+        if idx >= 0:
+            self.device_combo.setCurrentIndex(idx)
+        device_layout.addWidget(QLabel("Input Device:"))
+        device_layout.addWidget(self.device_combo)
+        device_group.setLayout(device_layout)
+        audio_layout.addWidget(device_group)
+        
+        audio_layout.addStretch()
+        tabs.addTab(audio_tab, "Audio")
+        
+        # ===== GPU/ENGINE TAB =====
+        engine_tab = QWidget()
+        engine_layout = QVBoxLayout(engine_tab)
+        
+        # GPU Settings
+        gpu_group = QGroupBox("GPU Acceleration")
+        gpu_layout = QVBoxLayout()
+        
+        self.use_gpu_check = QCheckBox("Enable GPU Acceleration (CUDA/MPS)")
+        self.use_gpu_check.setChecked(config.get("use_gpu", True))
+        self.use_gpu_check.setEnabled(gpu_manager.is_gpu_available())
+        gpu_layout.addWidget(self.use_gpu_check)
+        
+        gpu_info = QLabel(f"Status: {gpu_manager.device_name}")
+        gpu_info.setWordWrap(True)
+        gpu_layout.addWidget(gpu_info)
+        
+        if not gpu_manager.is_gpu_available():
+            gpu_warning = QLabel("⚠️ No GPU detected. Install CUDA (NVIDIA) or use Apple Silicon for GPU acceleration.")
+            gpu_warning.setWordWrap(True)
+            gpu_warning.setStyleSheet("color: #FFC107;")
+            gpu_layout.addWidget(gpu_warning)
+        
+        gpu_group.setLayout(gpu_layout)
+        engine_layout.addWidget(gpu_group)
+        
+        # Whisper Model
+        whisper_group = QGroupBox("Whisper Model")
+        whisper_layout = QVBoxLayout()
+        self.whisper_model_combo = QComboBox()
+        for model in WHISPER_MODELS:
+            self.whisper_model_combo.addItem(model.title(), model)
+        current_model = config.get("whisper_model", "base")
+        idx = self.whisper_model_combo.findData(current_model)
+        if idx >= 0:
+            self.whisper_model_combo.setCurrentIndex(idx)
+        whisper_layout.addWidget(QLabel("Model Size:"))
+        whisper_layout.addWidget(self.whisper_model_combo)
+        
+        model_info = QLabel(
+            "• Tiny: Fastest, less accurate\\n"
+            "• Base: Balanced (recommended)\\n"
+            "• Small/Medium/Large: Higher accuracy, slower"
+        )
+        model_info.setWordWrap(True)
+        whisper_layout.addWidget(model_info)
+        whisper_group.setLayout(whisper_layout)
+        engine_layout.addWidget(whisper_group)
+        
+        engine_layout.addStretch()
+        tabs.addTab(engine_tab, "GPU & Models")
+        
+        # ===== CACHE TAB =====
+        cache_tab = QWidget()
+        cache_layout = QVBoxLayout(cache_tab)
+        
+        cache_group = QGroupBox("Translation Cache")
+        cache_group_layout = QVBoxLayout()
+        
+        self.cache_enabled = QCheckBox("Enable Translation Caching")
+        self.cache_enabled.setChecked(config.get("cache_translations", True))
+        cache_group_layout.addWidget(self.cache_enabled)
+        
+        self.cache_expiry_spin = QSpinBox()
+        self.cache_expiry_spin.setRange(1, 365)
+        self.cache_expiry_spin.setValue(config.get("cache_expiry_days", 7))
+        self.cache_expiry_spin.setSuffix(" days")
+        cache_group_layout.addWidget(QLabel("Cache Expiry:"))
+        cache_group_layout.addWidget(self.cache_expiry_spin)
+        
+        cache_group.setLayout(cache_group_layout)
+        cache_layout.addWidget(cache_group)
+        
+        # Data locations
+        data_group = QGroupBox("Data Locations")
+        data_layout = QVBoxLayout()
+        data_layout.addWidget(QLabel(f"Configuration: {CONFIG_FILE}"))
+        data_layout.addWidget(QLabel(f"Database: {DB_FILE}"))
+        data_layout.addWidget(QLabel(f"Audio Cache: {AUDIO_DIR}"))
+        data_layout.addWidget(QLabel(f"Vosk Models: {VOSK_MODELS_DIR}"))
+        data_group.setLayout(data_layout)
+        cache_layout.addWidget(data_group)
+        
+        cache_layout.addStretch()
+        tabs.addTab(cache_tab, "Cache & Data")
+        
+        layout.addWidget(tabs)
+        
+        # Buttons
+        buttons = QHBoxLayout()
+        save_btn = QPushButton("💾 Save")
+        save_btn.clicked.connect(self.save_settings)
+        cancel_btn = QPushButton("✖ Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addStretch()
+        buttons.addWidget(save_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+    
+    def choose_text_color(self):
+        color = QColorDialog.getColor(QColor(self.text_color), self, "Choose Text Color")
+        if color.isValid():
+            self.text_color = color.name()
+            self.text_color_btn.setStyleSheet(f"background-color: {self.text_color};")
+    
+    def save_settings(self):
+        # Save all settings
+        config.set("theme", self.theme_combo.currentText().lower())
+        config.set("font_size", self.font_size_spin.value())
+        config.set("text_color", self.text_color)
+        config.set("animation_duration", self.anim_duration_spin.value())
+        config.set("max_words", self.max_words_spin.value())
+        config.set("tts_rate", self.tts_rate_spin.value())
+        config.set("volume", self.volume_slider.value() / 100.0)
+        config.set("audio_device_input", self.device_combo.currentData())
+        config.set("use_gpu", self.use_gpu_check.isChecked())
+        config.set("whisper_model", self.whisper_model_combo.currentData())
+        config.set("cache_translations", self.cache_enabled.isChecked())
+        config.set("cache_expiry_days", self.cache_expiry_spin.value())
+        
+        # Apply TTS volume immediately
+        tts_manager.set_volume(self.volume_slider.value() / 100.0)
+        
+        # Apply GPU setting immediately
+        whisper_manager.set_device(self.use_gpu_check.isChecked())
+        
+        self.accept()
+
+class ModelManagerDialog(QDialog):
+    """Model download and management dialog"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📥 Model Manager")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(500)
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        tabs = QTabWidget()
+        
+        # ===== WHISPER TAB =====
+        whisper_tab = QWidget()
+        whisper_layout = QVBoxLayout(whisper_tab)
+        
+        whisper_info = QLabel(
+            "Whisper models download automatically on first use.\\n"
+            "Models are cached in your home directory (~/.cache/whisper)."
+        )
+        whisper_info.setWordWrap(True)
+        whisper_layout.addWidget(whisper_info)
+        
+        whisper_group = QGroupBox("Available Whisper Models")
+        whisper_group_layout = QVBoxLayout()
+        
+        for model in WHISPER_MODELS:
+            model_row = QHBoxLayout()
+            label = QLabel(f"{model.title()}")
+            model_row.addWidget(label)
+            
+            size_label = QLabel()
+            if model == "tiny":
+                size_label.setText("~75 MB")
+            elif model == "base":
+                size_label.setText("~150 MB")
+            elif model == "small":
+                size_label.setText("~500 MB")
+            elif model == "medium":
+                size_label.setText("~1.5 GB")
+            elif model == "large":
+                size_label.setText("~3 GB")
+            model_row.addWidget(size_label)
+            
+            model_row.addStretch()
+            
+            download_btn = QPushButton("📥 Download")
+            download_btn.clicked.connect(lambda checked, m=model: self.download_whisper_model(m))
+            model_row.addWidget(download_btn)
+            
+            whisper_group_layout.addLayout(model_row)
+        
+        whisper_group.setLayout(whisper_group_layout)
+        whisper_layout.addWidget(whisper_group)
+        
+        current_device = QLabel(f"Current Device: {whisper_manager.device}")
+        whisper_layout.addWidget(current_device)
+        
+        whisper_layout.addStretch()
+        tabs.addTab(whisper_tab, "Whisper Models")
+        
+        # ===== VOSK TAB =====
+        vosk_tab = QWidget()
+        vosk_layout = QVBoxLayout(vosk_tab)
+        
+        vosk_info = QLabel(
+            f"Vosk models are downloaded to: {VOSK_MODELS_DIR}\\n"
+            "These are offline speech recognition models."
+        )
+        vosk_info.setWordWrap(True)
+        vosk_layout.addWidget(vosk_info)
+        
+        vosk_group = QGroupBox("Available Vosk Models")
+        vosk_group_layout = QVBoxLayout()
+        
+        for lang_code, url in VOSK_MODELS.items():
+            model_row = QHBoxLayout()
+            
+            lang_name = {"en": "English", "fr": "French", "es": "Spanish", "de": "German"}.get(lang_code, lang_code)
+            label = QLabel(f"{lang_name} ({lang_code})")
+            model_row.addWidget(label)
+            
+            has_model = vosk_manager.has_model(lang_code)
+            status = QLabel("✅ Installed" if has_model else "❌ Not installed")
+            model_row.addWidget(status)
+            
+            model_row.addStretch()
+            
+            if not has_model:
+                download_btn = QPushButton("📥 Download (~50 MB)")
+                download_btn.clicked.connect(lambda checked, lc=lang_code: self.download_vosk_model(lc))
+                model_row.addWidget(download_btn)
+            
+            vosk_group_layout.addLayout(model_row)
+        
+        vosk_group.setLayout(vosk_group_layout)
+        vosk_layout.addWidget(vosk_group)
+        
+        vosk_layout.addStretch()
+        tabs.addTab(vosk_tab, "Vosk Models")
+        
+        layout.addWidget(tabs)
+        
+        # Close button
+        close_btn = QPushButton("✖ Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+    
+    def download_whisper_model(self, model_name):
+        reply = QMessageBox.question(
+            self,
+            "Download Whisper Model",
+            f"Download {model_name} model?\\n\\nThe model will download automatically on first use.\\n"
+            f"You can test it by selecting '{model_name}' in Settings and using Whisper engine.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Create progress dialog
+            progress = QProgressDialog(f"Downloading Whisper {model_name} model...", None, 0, 0, self)
+            progress.setWindowTitle("Downloading")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.show()
+            QApplication.processEvents()
+            
+            # Download in thread to avoid blocking UI
+            success = whisper_manager.load_model(model_name)
+            
+            progress.close()
+            
+            if success:
+                QMessageBox.information(self, "Success", f"Whisper {model_name} model loaded successfully!")
+            else:
+                QMessageBox.warning(self, "Error", f"Failed to download {model_name} model. Check logs for details.")
+    
+    def download_vosk_model(self, lang_code):
+        reply = QMessageBox.question(
+            self,
+            "Download Vosk Model",
+            f"Download Vosk model for {lang_code}?\\n\\nSize: ~50 MB",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            progress = QProgressDialog(f"Downloading Vosk {lang_code} model...", "Cancel", 0, 100, self)
+            progress.setWindowTitle("Downloading")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.show()
+            
+            def update_progress(pct):
+                progress.setValue(int(pct * 100))
+                QApplication.processEvents()
+            
+            success = vosk_manager.download_model(lang_code, update_progress)
+            
+            progress.close()
+            
+            if success:
+                QMessageBox.information(self, "Success", f"Vosk {lang_code} model downloaded successfully!")
+                # Refresh the dialog
+                self.close()
+                new_dialog = ModelManagerDialog(self.parent())
+                new_dialog.exec()
+            else:
+                QMessageBox.warning(self, "Error", f"Failed to download {lang_code} model. Check logs for details.")
+
 class LiveTranslatorApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1058,8 +1509,10 @@ class LiveTranslatorApp(QMainWindow):
         top_bar.addWidget(self.status_label)
         
         # GPU status indicator
+        gpu_color = "#4CAF50" if gpu_manager.is_gpu_available() else "#FFC107"
         self.gpu_status = QLabel(f"🚀 {gpu_manager.device_name}")
-        self.gpu_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.gpu_status.setStyleSheet(f"color: {gpu_color}; font-weight: bold;")
+        self.gpu_status.setToolTip(f"Device: {gpu_manager.device}\nCUDA Available: {gpu_manager.has_cuda}\nMPS Available: {gpu_manager.has_mps}")
         top_bar.addWidget(self.gpu_status)
         
         # Performance monitor
@@ -1074,6 +1527,7 @@ class LiveTranslatorApp(QMainWindow):
         
         self.models_btn = QPushButton("📥 Models")
         self.models_btn.clicked.connect(self.show_models)
+        self.models_btn.setToolTip("Download and manage Whisper and Vosk models")
         top_bar.addWidget(self.models_btn)
         
         self.theme_btn = QPushButton("🌓 Theme")
@@ -1082,6 +1536,7 @@ class LiveTranslatorApp(QMainWindow):
         
         self.settings_btn = QPushButton("⚙️ Settings")
         self.settings_btn.clicked.connect(self.show_settings)
+        self.settings_btn.setToolTip("Configure all application settings")
         top_bar.addWidget(self.settings_btn)
         
         main_layout.addLayout(top_bar)
@@ -1194,15 +1649,18 @@ class LiveTranslatorApp(QMainWindow):
         
         self.listen_btn = QPushButton("🎤 Start Continuous Listening")
         self.listen_btn.clicked.connect(self.toggle_listening)
-        self.listen_btn.setStyleSheet("font-weight:bold;padding:12px;font-size:14px;")
+        self.listen_btn.setStyleSheet("font-weight:bold;padding:12px;font-size:14px;background:#4CAF50;color:white;")
+        self.listen_btn.setToolTip("Start continuous speech recognition (Ctrl+L)")
         controls_layout.addWidget(self.listen_btn, 0, 0, 1, 2)
         
         self.translate_btn = QPushButton("🔄 Translate")
         self.translate_btn.clicked.connect(self.translate_manual)
+        self.translate_btn.setToolTip("Manually translate the input text (Ctrl+T)")
         controls_layout.addWidget(self.translate_btn, 0, 2, 1, 2)
         
         self.speak_btn = QPushButton("🔊 Speak")
         self.speak_btn.clicked.connect(self.speak_output)
+        self.speak_btn.setToolTip("Speak the translated text (Ctrl+S)")
         controls_layout.addWidget(self.speak_btn, 1, 0)
         
         self.stop_btn = QPushButton("🔇 Stop")
@@ -1211,10 +1669,12 @@ class LiveTranslatorApp(QMainWindow):
         
         self.source_btn = QPushButton("🎧 System Audio")
         self.source_btn.clicked.connect(self.toggle_source)
+        self.source_btn.setToolTip("Switch between microphone and system audio input")
         controls_layout.addWidget(self.source_btn, 1, 2)
         
         self.overlay_btn = QPushButton("👁️ Overlay")
         self.overlay_btn.clicked.connect(self.toggle_overlay)
+        self.overlay_btn.setToolTip("Toggle the translation overlay (Ctrl+O)")
         controls_layout.addWidget(self.overlay_btn, 1, 3)
         
         self.auto_speak = QCheckBox("Auto-speak")
@@ -1270,7 +1730,7 @@ class LiveTranslatorApp(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Q"), self, self.close)
     
     def show_help(self):
-        help_text = """
+        help_text = f"""
 🎙️ Professional Edition v3.0 Features
 
 ✨ Continuous Listening
@@ -1285,9 +1745,15 @@ class LiveTranslatorApp(QMainWindow):
 - Min size: 300x120
 
 🚀 GPU Acceleration
-- Auto-detects CUDA/MPS
+- Current Status: {gpu_manager.device_name}
+- Device: {gpu_manager.device}
 - 10-20x faster Whisper transcription
-- Toggle in settings
+- Configure in Settings (⚙️)
+
+📥 Model Management
+- Click 'Models' to download Whisper/Vosk models
+- Whisper: tiny, base, small, medium, large
+- Vosk: Offline speech recognition
 
 ⚡ Keyboard Shortcuts
 - F1: This help
@@ -1297,8 +1763,17 @@ class LiveTranslatorApp(QMainWindow):
 - Ctrl+O: Toggle overlay
 - Ctrl+D: Toggle theme
 - Ctrl+Q: Quit
+
+⚙️ Settings
+- All settings now editable in Settings dialog
+- Audio devices, GPU, models, theme, etc.
+- Changes apply immediately
 """
-        QMessageBox.information(self, "Help - Professional Edition v3.0", help_text)
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Help - Professional Edition v3.0")
+        msg.setText(help_text)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.exec()
     
     def populate_languages(self, combo, include_auto=False):
         if include_auto:
@@ -1334,36 +1809,28 @@ class LiveTranslatorApp(QMainWindow):
         config.set("use_gpu", use_gpu)
         whisper_manager.set_device(use_gpu)
         device = whisper_manager.device
-        self.gpu_status.setText(f"🚀 Device: {device.upper()}")
+        self.gpu_status.setText(f"🚀 {device.upper()}")
         self.statusBar().showMessage(f"GPU {'enabled' if use_gpu else 'disabled'} - using {device}", 3000)
     
     def show_models(self):
-        msg = f"""
-📥 Model Information
-
-Whisper Models:
-- Models download automatically on first use
-- Current: {config.get('whisper_model', 'base')}
-- Device: {whisper_manager.device}
-- Available: {', '.join(WHISPER_MODELS)}
-
-Vosk Models:
-- Download from vosk.com
-- Place in: {VOSK_MODELS_DIR}
-- Supported: {', '.join(VOSK_MODELS.keys())}
-
-GPU Status: {gpu_manager.device_name}
-"""
-        QMessageBox.information(self, "Models", msg)
+        dialog = ModelManagerDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Refresh UI if needed
+            pass
     
     def show_settings(self):
-        QMessageBox.information(self, "Settings", 
-            f"Config file: {CONFIG_FILE}\n\n"
-            "Advanced settings:\n"
-            "- volume, tts_rate\n"
-            "- animation_duration\n"
-            "- cache_expiry_days\n"
-            "- max_words")
+        dialog = SettingsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Apply theme change if needed
+            theme = config.get("theme", "dark")
+            self.apply_theme(theme)
+            # Update overlay style
+            self.overlay.apply_style()
+            # Update GPU status
+            device = whisper_manager.device
+            self.gpu_status.setText(f"🚀 Device: {device.upper()}")
+            self.gpu_checkbox.setChecked(config.get("use_gpu", True))
+            self.statusBar().showMessage("Settings saved", 3000)
     
     def swap_languages(self):
         if self.source_lang_combo.currentData() == "auto":
