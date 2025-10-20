@@ -1,0 +1,1165 @@
+#!/usr/bin/env python3
+"""
+Universal Live Translator Desktop — Pro Edition v2.0
+----------------------------------------------------
+Complete working version - Copy and paste this entire file
+"""
+import os, sys, threading, queue, logging, sqlite3, tempfile, json, time
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple, Any
+from datetime import datetime
+from collections import deque
+import hashlib
+import numpy as np
+import warnings
+from dataclasses import dataclass
+from enum import Enum
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="ctranslate2")
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
+
+import subprocess
+
+REQUIRED_PACKAGES = [
+    "PyQt6", "pyttsx3", "gtts", "argostranslate", "SpeechRecognition",
+    "sounddevice", "vosk", "pydub", "langdetect", "deep-translator",
+    "simpleaudio", "numpy", "requests", "openai-whisper", "torch", "pyaudio", "scipy"
+]
+
+def ensure_dependencies():
+    missing = []
+    for pkg in REQUIRED_PACKAGES:
+        try:
+            __import__(pkg.replace('-', '_').split('[')[0])
+        except ImportError:
+            missing.append(pkg)
+    
+    if missing:
+        print(f"\n{'='*60}\nMissing Dependencies\n{'='*60}")
+        print("The following packages need to be installed:")
+        for pkg in missing:
+            print(f"  • {pkg}")
+        print(f"\nTotal size: ~500MB (includes PyTorch and Whisper)\n{'='*60}")
+        
+        response = input("\nInstall missing packages? (y/n): ").strip().lower()
+        if response == 'y':
+            for pkg in missing:
+                print(f"\n📦 Installing {pkg}...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+            print("\n✅ All dependencies installed!\n")
+        else:
+            print("\n❌ Cannot proceed without packages. Exiting...")
+            sys.exit(1)
+
+ensure_dependencies()
+
+import pyttsx3
+from gtts import gTTS
+import speech_recognition as sr
+import sounddevice as sd
+import pyaudio
+from vosk import Model, KaldiRecognizer
+from langdetect import detect, LangDetectException, detect_langs
+from deep_translator import GoogleTranslator
+from deep_translator.constants import GOOGLE_LANGUAGES_TO_CODES
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtGui import *
+from pydub import AudioSegment
+import simpleaudio as sa
+import argostranslate.translate
+import argostranslate.package
+import requests
+import whisper
+import torch
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('translator.log'),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger("Translator")
+
+BASE_DIR = Path.home() / ".universal_translator"
+BASE_DIR.mkdir(exist_ok=True, parents=True)
+
+DB_FILE = BASE_DIR / "translator_history.db"
+AUDIO_DIR = BASE_DIR / "audio_cache"
+VOSK_MODELS_DIR = BASE_DIR / "vosk_models"
+CONFIG_FILE = BASE_DIR / "translator_config.json"
+
+AUDIO_DIR.mkdir(exist_ok=True)
+VOSK_MODELS_DIR.mkdir(exist_ok=True)
+
+class RecognitionEngine(Enum):
+    GOOGLE = "google"
+    VOSK = "vosk"
+    WHISPER = "whisper"
+
+VOSK_MODELS = {
+    "en": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+    "fr": "https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip",
+    "es": "https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip",
+    "de": "https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip",
+}
+
+WHISPER_MODELS = ["tiny", "base", "small", "medium", "large"]
+
+DEFAULT_CONFIG = {
+    "theme": "dark", "overlay_position": [100, 100, 800, 150], "overlay_visible": True,
+    "font_size": 20, "text_color": "#FFFFFF", "bg_color": "rgba(20,20,30,0.85)",
+    "max_words": 100, "auto_speak": True, "tts_rate": 150, "volume": 0.8,
+    "cache_translations": True, "cache_expiry_days": 7, "source_language": "auto",
+    "target_language": "fr", "show_confidence": True, "recognition_engine": "google",
+    "whisper_model": "base", "audio_device_input": "default"
+}
+
+@dataclass
+class AudioDevice:
+    index: int
+    name: str
+    max_input_channels: int
+    max_output_channels: int
+    default_samplerate: float
+    is_input: bool
+    is_output: bool
+    host_api: str
+
+class AudioDeviceManager:
+    def __init__(self):
+        self.pa = pyaudio.PyAudio()
+        self.devices = self._detect_devices()
+        self.input_devices = [d for d in self.devices if d.is_input]
+    
+    def _detect_devices(self) -> List[AudioDevice]:
+        devices = []
+        try:
+            for i in range(self.pa.get_device_count()):
+                info = self.pa.get_device_info_by_index(i)
+                device = AudioDevice(
+                    index=i, name=info['name'],
+                    max_input_channels=info['maxInputChannels'],
+                    max_output_channels=info['maxOutputChannels'],
+                    default_samplerate=info['defaultSampleRate'],
+                    is_input=info['maxInputChannels'] > 0,
+                    is_output=info['maxOutputChannels'] > 0,
+                    host_api=self.pa.get_host_api_info_by_index(info['hostApi'])['name']
+                )
+                devices.append(device)
+        except Exception as e:
+            log.error(f"Error detecting devices: {e}")
+        return devices
+    
+    def get_default_input_device(self) -> Optional[AudioDevice]:
+        try:
+            default_info = self.pa.get_default_input_device_info()
+            for device in self.input_devices:
+                if device.index == default_info['index']:
+                    return device
+        except:
+            pass
+        return self.input_devices[0] if self.input_devices else None
+    
+    def get_loopback_device(self) -> Optional[AudioDevice]:
+        keywords = ['stereo mix', 'loopback', 'wave out', 'what u hear']
+        for device in self.input_devices:
+            if any(k in device.name.lower() for k in keywords):
+                return device
+        return None
+    
+    def test_device(self, device: AudioDevice, duration: float = 1.0) -> bool:
+        try:
+            stream = self.pa.open(format=pyaudio.paInt16, channels=1,
+                rate=int(device.default_samplerate), input=True,
+                input_device_index=device.index, frames_per_buffer=1024)
+            stream.read(int(device.default_samplerate * duration))
+            stream.stop_stream()
+            stream.close()
+            return True
+        except:
+            return False
+    
+    def cleanup(self):
+        self.pa.terminate()
+
+audio_device_manager = AudioDeviceManager()
+
+class ConfigManager:
+    def __init__(self):
+        self.config = self.load_config()
+        self.lock = threading.Lock()
+    
+    def load_config(self) -> dict:
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    return {**DEFAULT_CONFIG, **json.load(f)}
+            except:
+                pass
+        return DEFAULT_CONFIG.copy()
+    
+    def save_config(self):
+        with self.lock:
+            try:
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump(self.config, f, indent=2)
+            except Exception as e:
+                log.error(f"Save config failed: {e}")
+    
+    def get(self, key: str, default=None):
+        with self.lock:
+            return self.config.get(key, default)
+    
+    def set(self, key: str, value):
+        with self.lock:
+            self.config[key] = value
+        self.save_config()
+
+config = ConfigManager()
+
+class DatabaseManager:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._local = threading.local()
+        self.init_tables()
+    
+    def _get_connection(self):
+        if not hasattr(self._local, 'conn'):
+            self._local.conn = sqlite3.connect(str(self.db_path), check_same_thread=True)
+            self._local.conn.row_factory = sqlite3.Row
+        return self._local.conn
+    
+    def init_tables(self):
+        conn = self._get_connection()
+        conn.execute("""CREATE TABLE IF NOT EXISTS translations (
+            id INTEGER PRIMARY KEY, source_text TEXT, translated_text TEXT,
+            source_lang TEXT, target_lang TEXT, mode TEXT, engine TEXT,
+            confidence REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, duration_ms INTEGER)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS cache (
+            id INTEGER PRIMARY KEY, hash TEXT UNIQUE, source_text TEXT, translated_text TEXT,
+            source_lang TEXT, target_lang TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            access_count INTEGER DEFAULT 0, last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        conn.commit()
+    
+    def add_translation(self, source, translated, src_lang, tgt_lang, mode, engine="google", confidence=1.0, duration_ms=0):
+        conn = self._get_connection()
+        conn.execute("INSERT INTO translations (source_text, translated_text, source_lang, target_lang, mode, engine, confidence, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (source, translated, src_lang, tgt_lang, mode, engine, confidence, duration_ms))
+        conn.commit()
+    
+    def get_cached_translation(self, text, src, tgt):
+        key = hashlib.md5(f"{text}:{src}:{tgt}".encode()).hexdigest()
+        conn = self._get_connection()
+        result = conn.execute("SELECT translated_text FROM cache WHERE hash = ?", (key,)).fetchone()
+        return result[0] if result else None
+    
+    def cache_translation(self, text, translated, src, tgt):
+        key = hashlib.md5(f"{text}:{src}:{tgt}".encode()).hexdigest()
+        conn = self._get_connection()
+        try:
+            conn.execute("INSERT OR REPLACE INTO cache (hash, source_text, translated_text, source_lang, target_lang, last_accessed) VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                (key, text, translated, src, tgt))
+            conn.commit()
+        except:
+            pass
+    
+    def get_history(self, limit=50, search=""):
+        conn = self._get_connection()
+        if search:
+            results = conn.execute("SELECT source_text, translated_text, source_lang, target_lang, mode, engine, confidence, timestamp FROM translations WHERE source_text LIKE ? OR translated_text LIKE ? ORDER BY id DESC LIMIT ?",
+                (f"%{search}%", f"%{search}%", limit)).fetchall()
+        else:
+            results = conn.execute("SELECT source_text, translated_text, source_lang, target_lang, mode, engine, confidence, timestamp FROM translations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in results]
+    
+    def export_history(self, filepath):
+        conn = self._get_connection()
+        results = conn.execute("SELECT * FROM translations ORDER BY timestamp DESC").fetchall()
+        with open(filepath, 'w', encoding='utf-8') as f:
+            for row in results:
+                r = dict(row)
+                f.write(f"[{r['timestamp']}] {r['source_lang']}→{r['target_lang']} ({r['mode']}/{r['engine']})\n")
+                f.write(f"Source: {r['source_text']}\nTranslation: {r['translated_text']}\n{'-'*80}\n\n")
+    
+    def clear_history(self):
+        conn = self._get_connection()
+        conn.execute("DELETE FROM translations")
+        conn.commit()
+
+db = DatabaseManager(DB_FILE)
+
+def is_online():
+    try:
+        requests.get("https://www.google.com", timeout=3)
+        return True
+    except:
+        return False
+
+class WhisperModelManager:
+    def __init__(self):
+        self.models = {}
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    def load_model(self, model_size="base"):
+        if model_size in self.models:
+            return True
+        try:
+            log.info(f"Loading Whisper {model_size}...")
+            self.models[model_size] = whisper.load_model(model_size, device=self.device)
+            return True
+        except Exception as e:
+            log.error(f"Whisper load failed: {e}")
+            return False
+    
+    def transcribe(self, audio_data, model_size="base", language=None):
+        if model_size not in self.models:
+            if not self.load_model(model_size):
+                return "", 0.0
+        try:
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32) / 32768.0
+            result = self.models[model_size].transcribe(audio_data, language=language, task="transcribe", fp16=(self.device=="cuda"))
+            text = result.get("text", "").strip()
+            segments = result.get("segments", [])
+            confidence = 1.0 - (sum(s.get("no_speech_prob", 0) for s in segments) / len(segments) if segments else 0)
+            return text, confidence
+        except Exception as e:
+            log.error(f"Whisper transcribe failed: {e}")
+            return "", 0.0
+
+whisper_manager = WhisperModelManager()
+
+class VoskModelManager:
+    def __init__(self):
+        self.models = {}
+        self.load_existing_models()
+    
+    def load_existing_models(self):
+        for lang_code in VOSK_MODELS.keys():
+            model_dir = VOSK_MODELS_DIR / f"vosk-model-small-{lang_code}"
+            if model_dir.exists():
+                try:
+                    self.models[lang_code] = Model(str(model_dir))
+                except:
+                    pass
+    
+    def get_model(self, lang_code):
+        return self.models.get(lang_code)
+    
+    def download_model(self, lang_code, progress_callback=None):
+        if lang_code not in VOSK_MODELS:
+            return False
+        model_dir = VOSK_MODELS_DIR / f"vosk-model-small-{lang_code}"
+        if model_dir.exists():
+            return True
+        try:
+            url = VOSK_MODELS[lang_code]
+            zip_path = VOSK_MODELS_DIR / f"model-{lang_code}.zip"
+            response = requests.get(url, stream=True)
+            total = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            with open(zip_path, 'wb') as f:
+                for chunk in response.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback and total > 0:
+                            progress_callback(downloaded / total)
+            import zipfile
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                z.extractall(VOSK_MODELS_DIR)
+            zip_path.unlink()
+            for item in VOSK_MODELS_DIR.iterdir():
+                if item.is_dir() and lang_code in item.name.lower():
+                    if item.name != f"vosk-model-small-{lang_code}":
+                        item.rename(model_dir)
+                    break
+            self.models[lang_code] = Model(str(model_dir))
+            return True
+        except Exception as e:
+            log.error(f"Download failed: {e}")
+            return False
+    
+    def has_model(self, lang_code):
+        return lang_code in self.models
+
+vosk_manager = VoskModelManager()
+
+def setup_argos():
+    try:
+        argostranslate.package.update_package_index()
+        available = argostranslate.package.get_available_packages()
+        installed = {l.code for l in argostranslate.translate.get_installed_languages()}
+        for from_l in ["en", "fr", "es"]:
+            for to_l in ["en", "fr", "es"]:
+                if from_l != to_l and from_l not in installed:
+                    pkg = next((p for p in available if p.from_code==from_l and p.to_code==to_l), None)
+                    if pkg:
+                        argostranslate.package.install_from_path(pkg.download())
+    except:
+        pass
+
+threading.Thread(target=setup_argos, daemon=True).start()
+
+class TranslationEngine:
+    def translate(self, text, src, tgt):
+        if not text.strip():
+            return "", 0, 1.0
+        if config.get("cache_translations"):
+            cached = db.get_cached_translation(text, src, tgt)
+            if cached:
+                return cached, 0, 1.0
+        start = time.time()
+        translated = None
+        confidence = 1.0
+        if is_online():
+            try:
+                translated = GoogleTranslator(source=src, target=tgt).translate(text)
+            except:
+                pass
+        if not translated:
+            try:
+                translated = argostranslate.translate.translate(text, from_code=src, to_code=tgt)
+                confidence = 0.85
+            except:
+                translated = text
+                confidence = 0.0
+        duration = int((time.time() - start) * 1000)
+        if translated and config.get("cache_translations"):
+            db.cache_translation(text, translated, src, tgt)
+        return translated, duration, confidence
+
+translator = TranslationEngine()
+
+class TTSManager:
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.running = True
+        self.current = None
+        self.volume = config.get("volume", 0.8)
+        self.temp_files = []
+        threading.Thread(target=self._worker, daemon=True).start()
+    
+    def _worker(self):
+        while self.running:
+            try:
+                text, lang = self.queue.get(timeout=0.5)
+                self._speak(text, lang)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                log.warning(f"TTS error: {e}")
+    
+    def _speak(self, text, lang):
+        try:
+            if is_online():
+                tts = gTTS(text=text, lang=lang, slow=False)
+                tmp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=AUDIO_DIR)
+                tmp_mp3.close()
+                tts.save(tmp_mp3.name)
+                tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=AUDIO_DIR)
+                tmp_wav.close()
+                audio = AudioSegment.from_mp3(tmp_mp3.name)
+                audio = audio + (20 * np.log10(self.volume))
+                audio.export(tmp_wav.name, format="wav")
+                wave_obj = sa.WaveObject.from_wave_file(tmp_wav.name)
+                self.current = wave_obj.play()
+                self.current.wait_done()
+                os.unlink(tmp_mp3.name)
+                os.unlink(tmp_wav.name)
+            else:
+                engine = pyttsx3.init()
+                engine.setProperty('rate', config.get("tts_rate", 150))
+                engine.say(text)
+                engine.runAndWait()
+        except Exception as e:
+            log.error(f"TTS failed: {e}")
+    
+    def speak(self, text, lang):
+        if text.strip():
+            self.queue.put((text, lang))
+    
+    def stop(self):
+        if self.current and self.current.is_playing():
+            self.current.stop()
+    
+    def set_volume(self, volume):
+        self.volume = max(0.0, min(1.0, volume))
+    
+    def shutdown(self):
+        self.running = False
+        self.stop()
+
+tts_manager = TTSManager()
+
+class SpeechRecognitionThread(QThread):
+    phrase_detected = pyqtSignal(str, float)
+    status_changed = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, source_type="microphone", language="en", engine=RecognitionEngine.GOOGLE, device_index=None):
+        super().__init__()
+        self.running = True
+        self.source_type = source_type
+        self.language = language
+        self.engine = engine
+        self.device_index = device_index
+        self.vosk_model = vosk_manager.get_model(language) if engine == RecognitionEngine.VOSK else None
+        self.whisper_model_size = config.get("whisper_model", "base")
+    
+    def run(self):
+        try:
+            if self.source_type == "microphone":
+                self._listen_microphone()
+            else:
+                self._listen_system_audio()
+        except Exception as e:
+            self.error_occurred.emit(f"Recognition error: {e}")
+    
+    def _listen_microphone(self):
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold = 3000
+        recognizer.pause_threshold = 1.2
+        try:
+            kwargs = {}
+            if self.device_index is not None:
+                kwargs['device_index'] = self.device_index
+            with sr.Microphone(**kwargs) as source:
+                self.status_changed.emit("Calibrating...")
+                recognizer.adjust_for_ambient_noise(source, 1)
+                self.status_changed.emit(f"Listening ({self.engine.value})...")
+                while self.running:
+                    try:
+                        audio = recognizer.listen(source, timeout=None, phrase_time_limit=15)
+                        self.status_changed.emit("Processing...")
+                        text, conf = None, 1.0
+                        if self.engine == RecognitionEngine.WHISPER:
+                            text, conf = self._recognize_whisper(audio)
+                        elif self.engine == RecognitionEngine.VOSK and self.vosk_model:
+                            text, conf = self._recognize_vosk(audio.get_wav_data())
+                        elif self.engine == RecognitionEngine.GOOGLE:
+                            if is_online():
+                                try:
+                                    text = recognizer.recognize_google(audio, language=self.language)
+                                except:
+                                    pass
+                        if text and text.strip():
+                            self.phrase_detected.emit(text, conf)
+                            self.status_changed.emit(f"Listening ({self.engine.value})...")
+                    except sr.WaitTimeoutError:
+                        pass
+                    except Exception as e:
+                        log.warning(f"Mic error: {e}")
+                        time.sleep(0.5)
+        except Exception as e:
+            self.error_occurred.emit(f"Microphone setup failed: {e}")
+    
+    def _listen_system_audio(self):
+        loopback = audio_device_manager.get_loopback_device()
+        if not loopback:
+            self.error_occurred.emit("No loopback device found.\nWindows: Enable 'Stereo Mix'\nmacOS: Install BlackHole")
+            return
+        samplerate = min(int(loopback.default_samplerate), 16000)
+        audio_buffer = []
+        samples_needed = int(samplerate * 5.0)
+        def callback(indata, frames, time_info, status):
+            if not self.running:
+                raise sd.CallbackStop()
+            audio_buffer.extend(indata[:, 0].copy())
+            if len(audio_buffer) >= samples_needed:
+                chunk = np.array(audio_buffer[:samples_needed])
+                audio_buffer.clear()
+                threading.Thread(target=self._process_system, args=(chunk, samplerate), daemon=True).start()
+        try:
+            self.status_changed.emit(f"Capturing system audio ({self.engine.value})...")
+            with sd.InputStream(channels=1, samplerate=samplerate, device=loopback.index, callback=callback, blocksize=4096):
+                while self.running:
+                    sd.sleep(100)
+        except Exception as e:
+            self.error_occurred.emit(f"System audio failed: {e}")
+    
+    def _process_system(self, audio_data, samplerate):
+        try:
+            energy = np.sqrt(np.mean(audio_data ** 2))
+            if energy < 0.01:
+                return
+            text, conf = "", 0.0
+            if self.engine == RecognitionEngine.WHISPER:
+                text, conf = self._transcribe_whisper_array(audio_data, samplerate)
+            elif self.engine == RecognitionEngine.VOSK and self.vosk_model:
+                audio_int = (audio_data * 32767).astype(np.int16)
+                text, conf = self._recognize_vosk(audio_int.tobytes())
+            if text and text.strip():
+                self.phrase_detected.emit(text, conf)
+        except Exception as e:
+            log.error(f"Process system audio error: {e}")
+    
+    def _recognize_vosk(self, wav_data):
+        if not self.vosk_model:
+            return "", 0.0
+        try:
+            rec = KaldiRecognizer(self.vosk_model, 16000)
+            rec.SetWords(True)
+            rec.AcceptWaveform(wav_data)
+            result = json.loads(rec.FinalResult())
+            return result.get("text", ""), result.get("confidence", 0.9)
+        except:
+            return "", 0.0
+    
+    def _recognize_whisper(self, audio):
+        try:
+            audio_np = np.frombuffer(audio.get_wav_data(), dtype=np.int16).astype(np.float32) / 32768.0
+            if audio.sample_rate != 16000:
+                from scipy import signal
+                audio_np = signal.resample(audio_np, int(len(audio_np) * 16000 / audio.sample_rate))
+            lang = self.language if self.language != "auto" else None
+            return whisper_manager.transcribe(audio_np, self.whisper_model_size, lang)
+        except:
+            return "", 0.0
+    
+    def _transcribe_whisper_array(self, audio_data, samplerate):
+        try:
+            if samplerate != 16000:
+                from scipy import signal
+                audio_data = signal.resample(audio_data, int(len(audio_data) * 16000 / samplerate))
+            lang = self.language if self.language != "auto" else None
+            return whisper_manager.transcribe(audio_data, self.whisper_model_size, lang)
+        except:
+            return "", 0.0
+    
+    def stop(self):
+        self.running = False
+
+class SubtitleOverlay(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.container = QWidget(self)
+        self.container.setObjectName("overlayContainer")
+        self.label = QLabel("", self.container)
+        self.label.setWordWrap(True)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.label.setMouseTracking(True)
+        layout = QVBoxLayout(self.container)
+        layout.addWidget(self.label)
+        layout.setContentsMargins(15, 15, 15, 15)
+        main = QVBoxLayout(self)
+        main.addWidget(self.container)
+        main.setContentsMargins(0, 0, 0, 0)
+        self.text_buffer = deque(maxlen=config.get("max_words", 100))
+        self.dragging = False
+        self.drag_start = None
+        self.apply_style()
+        geom = config.get("overlay_position", [100, 100, 800, 180])
+        self.setGeometry(*geom)
+        self.setVisible(config.get("overlay_visible", True))
+    
+    def apply_style(self):
+        fs = config.get("font_size", 20)
+        tc = config.get("text_color", "#FFFFFF")
+        bg = config.get("bg_color", "rgba(20,20,30,0.90)")
+        self.setStyleSheet(f"#overlayContainer{{background:{bg};border-radius:12px;border:2px solid rgba(255,255,255,0.15);}}QLabel{{color:{tc};font-size:{fs}px;font-weight:400;line-height:1.6;background:transparent;}}")
+    
+    def add_text(self, text, is_translation=True):
+        if not text.strip():
+            return
+        for word in text.split():
+            self.text_buffer.append(word)
+        self.update_display()
+    
+    def update_display(self):
+        if not self.text_buffer:
+            self.label.setText("")
+            return
+        text = " ".join(list(self.text_buffer))
+        self.label.setText(text)
+    
+    def clear_subtitles(self):
+        self.text_buffer.clear()
+        self.label.setText("")
+    
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.dragging = True
+            self.drag_start = e.globalPosition().toPoint() - self.pos()
+    
+    def mouseMoveEvent(self, e):
+        if self.dragging:
+            self.move(e.globalPosition().toPoint() - self.drag_start)
+    
+    def mouseReleaseEvent(self, e):
+        if self.dragging:
+            geom = self.geometry()
+            config.set("overlay_position", [geom.x(), geom.y(), geom.width(), geom.height()])
+        self.dragging = False
+
+class LiveTranslatorApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("🌍 Universal Live Translator — Pro Edition v2.0")
+        self.resize(1200, 900)
+        self.recognition_thread = None
+        self.source_type = "microphone"
+        self.translation_mode = "Real-time"
+        self.recognition_engine = RecognitionEngine.GOOGLE
+        self.overlay = SubtitleOverlay()
+        self.overlay.show()
+        self.setup_ui()
+        self.apply_theme(config.get("theme", "dark"))
+        self.load_settings()
+    
+    def setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setSpacing(15)
+        
+        # Top bar
+        top_bar = QHBoxLayout()
+        self.status_label = QLabel("🌐 Ready")
+        top_bar.addWidget(self.status_label)
+        top_bar.addStretch()
+        
+        self.models_btn = QPushButton("📥 Models")
+        self.models_btn.clicked.connect(self.show_models)
+        top_bar.addWidget(self.models_btn)
+        
+        self.theme_btn = QPushButton("🌓 Theme")
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        top_bar.addWidget(self.theme_btn)
+        
+        self.settings_btn = QPushButton("⚙️ Settings")
+        self.settings_btn.clicked.connect(self.show_settings)
+        top_bar.addWidget(self.settings_btn)
+        
+        main_layout.addLayout(top_bar)
+        
+        # Config
+        config_group = QGroupBox("🌐 Configuration")
+        config_layout = QVBoxLayout()
+        
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(QLabel("From:"))
+        self.source_lang_combo = QComboBox()
+        self.populate_languages(self.source_lang_combo, True)
+        lang_row.addWidget(self.source_lang_combo, 1)
+        
+        self.swap_btn = QPushButton("⇄")
+        self.swap_btn.setMaximumWidth(50)
+        self.swap_btn.clicked.connect(self.swap_languages)
+        lang_row.addWidget(self.swap_btn)
+        
+        lang_row.addWidget(QLabel("To:"))
+        self.target_lang_combo = QComboBox()
+        self.populate_languages(self.target_lang_combo)
+        lang_row.addWidget(self.target_lang_combo, 1)
+        
+        config_layout.addLayout(lang_row)
+        
+        engine_row = QHBoxLayout()
+        engine_row.addWidget(QLabel("Engine:"))
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("🌐 Google", RecognitionEngine.GOOGLE.value)
+        self.engine_combo.addItem("💻 Vosk", RecognitionEngine.VOSK.value)
+        self.engine_combo.addItem("🤖 Whisper", RecognitionEngine.WHISPER.value)
+        self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
+        engine_row.addWidget(self.engine_combo, 1)
+        
+        engine_row.addWidget(QLabel("Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Real-time", "Manual", "Continuous"])
+        self.mode_combo.currentTextChanged.connect(lambda m: setattr(self, 'translation_mode', m))
+        engine_row.addWidget(self.mode_combo, 1)
+        
+        config_layout.addLayout(engine_row)
+        
+        self.model_status = QLabel("Ready")
+        config_layout.addWidget(self.model_status)
+        
+        config_group.setLayout(config_layout)
+        main_layout.addWidget(config_group)
+        
+        # Input/Output
+        io_splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        input_widget = QWidget()
+        input_layout = QVBoxLayout(input_widget)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        
+        input_header = QHBoxLayout()
+        input_header.addWidget(QLabel("🎙️ Input"))
+        self.confidence_label = QLabel()
+        input_header.addWidget(self.confidence_label)
+        input_header.addStretch()
+        self.word_count = QLabel("0 words")
+        input_header.addWidget(self.word_count)
+        input_layout.addLayout(input_header)
+        
+        self.input_text = QTextEdit()
+        self.input_text.setPlaceholderText("Speak or type here...")
+        self.input_text.textChanged.connect(self.update_word_count)
+        input_layout.addWidget(self.input_text)
+        
+        io_splitter.addWidget(input_widget)
+        
+        output_widget = QWidget()
+        output_layout = QVBoxLayout(output_widget)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        
+        output_header = QHBoxLayout()
+        output_header.addWidget(QLabel("🈯 Translation"))
+        output_header.addStretch()
+        self.copy_btn = QPushButton("📋 Copy")
+        self.copy_btn.clicked.connect(self.copy_output)
+        output_header.addWidget(self.copy_btn)
+        output_layout.addLayout(output_header)
+        
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        self.output_text.setPlaceholderText("Translation appears here...")
+        output_layout.addWidget(self.output_text)
+        
+        io_splitter.addWidget(output_widget)
+        main_layout.addWidget(io_splitter, 3)
+        
+        # Controls
+        controls = QWidget()
+        controls_layout = QGridLayout(controls)
+        
+        self.listen_btn = QPushButton("🎤 Start Listening")
+        self.listen_btn.clicked.connect(self.toggle_listening)
+        self.listen_btn.setStyleSheet("font-weight:bold;padding:10px;font-size:14px;")
+        controls_layout.addWidget(self.listen_btn, 0, 0, 1, 2)
+        
+        self.translate_btn = QPushButton("🔄 Translate")
+        self.translate_btn.clicked.connect(self.translate_manual)
+        controls_layout.addWidget(self.translate_btn, 0, 2, 1, 2)
+        
+        self.speak_btn = QPushButton("🔊 Speak")
+        self.speak_btn.clicked.connect(self.speak_output)
+        controls_layout.addWidget(self.speak_btn, 1, 0)
+        
+        self.stop_btn = QPushButton("🔇 Stop")
+        self.stop_btn.clicked.connect(lambda: tts_manager.stop())
+        controls_layout.addWidget(self.stop_btn, 1, 1)
+        
+        self.source_btn = QPushButton("🎧 System Audio")
+        self.source_btn.clicked.connect(self.toggle_source)
+        controls_layout.addWidget(self.source_btn, 1, 2)
+        
+        self.overlay_btn = QPushButton("👁️ Overlay")
+        self.overlay_btn.clicked.connect(self.toggle_overlay)
+        controls_layout.addWidget(self.overlay_btn, 1, 3)
+        
+        self.auto_speak = QCheckBox("Auto-speak")
+        self.auto_speak.setChecked(config.get("auto_speak", True))
+        self.auto_speak.stateChanged.connect(lambda: config.set("auto_speak", self.auto_speak.isChecked()))
+        controls_layout.addWidget(self.auto_speak, 2, 0, 1, 2)
+        
+        self.show_conf = QCheckBox("Show confidence")
+        self.show_conf.setChecked(config.get("show_confidence", True))
+        self.show_conf.stateChanged.connect(lambda: config.set("show_confidence", self.show_conf.isChecked()))
+        controls_layout.addWidget(self.show_conf, 2, 2, 1, 2)
+        
+        main_layout.addWidget(controls)
+        
+        # History
+        history_group = QGroupBox("📜 History")
+        history_layout = QVBoxLayout()
+        
+        history_controls = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search...")
+        self.search_input.textChanged.connect(self.search_history)
+        history_controls.addWidget(self.search_input)
+        
+        self.export_btn = QPushButton("💾 Export")
+        self.export_btn.clicked.connect(self.export_history)
+        history_controls.addWidget(self.export_btn)
+        
+        self.clear_btn = QPushButton("🗑️ Clear")
+        self.clear_btn.clicked.connect(self.clear_history)
+        history_controls.addWidget(self.clear_btn)
+        
+        history_layout.addLayout(history_controls)
+        
+        self.history_list = QListWidget()
+        self.history_list.itemDoubleClicked.connect(self.load_history_item)
+        history_layout.addWidget(self.history_list)
+        
+        history_group.setLayout(history_layout)
+        main_layout.addWidget(history_group, 1)
+        
+        self.statusBar().showMessage("Ready")
+        self.refresh_history()
+        self.setup_shortcuts()
+    
+    def setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+L"), self, self.toggle_listening)
+        QShortcut(QKeySequence("Ctrl+T"), self, self.translate_manual)
+        QShortcut(QKeySequence("Ctrl+S"), self, self.speak_output)
+        QShortcut(QKeySequence("Ctrl+O"), self, self.toggle_overlay)
+        QShortcut(QKeySequence("Ctrl+D"), self, self.toggle_theme)
+        QShortcut(QKeySequence("Ctrl+Q"), self, self.close)
+    
+    def populate_languages(self, combo, include_auto=False):
+        if include_auto:
+            combo.addItem("🔍 Auto", "auto")
+        langs = sorted([(n.title(), c) for n, c in GOOGLE_LANGUAGES_TO_CODES.items()], key=lambda x: x[0])
+        for name, code in langs:
+            combo.addItem(name, code)
+    
+    def load_settings(self):
+        src = config.get("source_language", "auto")
+        tgt = config.get("target_language", "fr")
+        engine = config.get("recognition_engine", "google")
+        idx = self.source_lang_combo.findData(src)
+        if idx >= 0:
+            self.source_lang_combo.setCurrentIndex(idx)
+        idx = self.target_lang_combo.findData(tgt)
+        if idx >= 0:
+            self.target_lang_combo.setCurrentIndex(idx)
+        idx = self.engine_combo.findData(engine)
+        if idx >= 0:
+            self.engine_combo.setCurrentIndex(idx)
+    
+    def on_engine_changed(self):
+        engine_val = self.engine_combo.currentData()
+        self.recognition_engine = RecognitionEngine(engine_val)
+        config.set("recognition_engine", engine_val)
+        if self.recognition_thread and self.recognition_thread.isRunning():
+            self.stop_listening()
+            QTimer.singleShot(500, self.start_listening)
+    
+    def show_models(self):
+        QMessageBox.information(self, "Models", "Download Vosk models from vosk.com\nWhisper models download automatically on first use")
+    
+    def show_settings(self):
+        QMessageBox.information(self, "Settings", "Configure volume, TTS rate, and cache in config file")
+    
+    def swap_languages(self):
+        if self.source_lang_combo.currentData() == "auto":
+            self.statusBar().showMessage("Cannot swap with auto-detect", 3000)
+            return
+        src_idx = self.source_lang_combo.currentIndex()
+        tgt_idx = self.target_lang_combo.currentIndex()
+        self.source_lang_combo.setCurrentIndex(tgt_idx)
+        self.target_lang_combo.setCurrentIndex(src_idx - 1)
+    
+    def update_word_count(self):
+        text = self.input_text.toPlainText()
+        words = len(text.split()) if text.strip() else 0
+        self.word_count.setText(f"{words} words")
+    
+    def toggle_listening(self):
+        if self.recognition_thread and self.recognition_thread.isRunning():
+            self.stop_listening()
+        else:
+            self.start_listening()
+    
+    def start_listening(self):
+        if self.recognition_thread:
+            self.recognition_thread.stop()
+            self.recognition_thread.wait()
+        src_lang = self.source_lang_combo.currentData()
+        if src_lang == "auto":
+            src_lang = "en"
+        device_idx = config.get("audio_device_input", "default")
+        if device_idx == "default":
+            device_idx = None
+        else:
+            device_idx = int(device_idx)
+        self.recognition_thread = SpeechRecognitionThread(self.source_type, src_lang, self.recognition_engine, device_idx)
+        self.recognition_thread.phrase_detected.connect(self.handle_phrase)
+        self.recognition_thread.status_changed.connect(lambda s: self.statusBar().showMessage(s))
+        self.recognition_thread.error_occurred.connect(lambda e: QMessageBox.warning(self, "Error", e) or self.stop_listening())
+        self.recognition_thread.start()
+        self.listen_btn.setText("⏹️ Stop")
+        self.listen_btn.setStyleSheet("background:#D32F2F;color:white;font-weight:bold;padding:10px;font-size:14px;")
+        self.statusBar().showMessage(f"Listening ({self.recognition_engine.value})...")
+    
+    def stop_listening(self):
+        if self.recognition_thread:
+            self.recognition_thread.stop()
+            self.recognition_thread.wait()
+            self.recognition_thread = None
+        self.listen_btn.setText("🎤 Start Listening")
+        self.listen_btn.setStyleSheet("font-weight:bold;padding:10px;font-size:14px;")
+        self.statusBar().showMessage("Stopped")
+    
+    def toggle_source(self):
+        self.source_type = "system" if self.source_type == "microphone" else "microphone"
+        self.source_btn.setText("🎤 Microphone" if self.source_type == "system" else "🎧 System Audio")
+        if self.recognition_thread and self.recognition_thread.isRunning():
+            self.stop_listening()
+            QTimer.singleShot(500, self.start_listening)
+    
+    def handle_phrase(self, phrase, confidence):
+        if not phrase.strip():
+            return
+        cursor = self.input_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        conf_str = f" [{confidence:.0%}]" if config.get("show_confidence") else ""
+        cursor.insertText(f"[{timestamp}]{conf_str} {phrase}\n")
+        self.input_text.setTextCursor(cursor)
+        self.input_text.ensureCursorVisible()
+        self.confidence_label.setText(f"Confidence: {confidence:.0%}")
+        if self.translation_mode in ["Real-time", "Continuous"]:
+            self.translate_phrase(phrase, confidence)
+    
+    def translate_phrase(self, phrase, speech_conf=1.0):
+        src_lang = self.source_lang_combo.currentData()
+        tgt_lang = self.target_lang_combo.currentData()
+        if src_lang == "auto":
+            try:
+                detections = detect_langs(phrase)
+                src_lang = detections[0].lang if detections else "en"
+            except:
+                src_lang = "en"
+        translated, duration, trans_conf = translator.translate(phrase, src_lang, tgt_lang)
+        combined_conf = speech_conf * trans_conf
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        conf_str = f" [{combined_conf:.0%}]" if config.get("show_confidence") else ""
+        self.output_text.append(f"[{timestamp}]{conf_str} {translated}")
+        self.overlay.add_text(translated)
+        if config.get("auto_speak", True):
+            tts_manager.speak(translated, tgt_lang)
+        db.add_translation(phrase, translated, src_lang, tgt_lang, self.translation_mode, self.recognition_engine.value, combined_conf, duration)
+        self.refresh_history()
+        self.statusBar().showMessage(f"Translated ({duration}ms, {combined_conf:.0%})", 2000)
+    
+    def translate_manual(self):
+        text = self.input_text.toPlainText().strip()
+        if not text:
+            self.statusBar().showMessage("No text", 3000)
+            return
+        src_lang = self.source_lang_combo.currentData()
+        tgt_lang = self.target_lang_combo.currentData()
+        if src_lang == "auto":
+            try:
+                src_lang = detect_langs(text)[0].lang if detect_langs(text) else "en"
+            except:
+                src_lang = "en"
+        self.statusBar().showMessage("Translating...")
+        QApplication.processEvents()
+        translated, duration, conf = translator.translate(text, src_lang, tgt_lang)
+        self.output_text.clear()
+        conf_str = f" [{conf:.0%}]" if config.get("show_confidence") else ""
+        self.output_text.append(f"{translated}{conf_str}")
+        self.overlay.add_text(translated)
+        if config.get("auto_speak", True):
+            tts_manager.speak(translated, tgt_lang)
+        db.add_translation(text, translated, src_lang, tgt_lang, "Manual", "manual", conf, duration)
+        self.refresh_history()
+        self.statusBar().showMessage(f"Done ({duration}ms, {conf:.0%})", 3000)
+    
+    def speak_output(self):
+        text = self.output_text.toPlainText().strip()
+        if not text:
+            return
+        import re
+        text = re.sub(r'\[.*?\]\s*', '', text)
+        lang = self.target_lang_combo.currentData()
+        tts_manager.speak(text, lang)
+    
+    def copy_output(self):
+        text = self.output_text.toPlainText()
+        import re
+        text = re.sub(r'\[.*?\]\s*', '', text)
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage("Copied!", 2000)
+    
+    def toggle_overlay(self):
+        self.overlay.setVisible(not self.overlay.isVisible())
+    
+    def refresh_history(self, search=""):
+        self.history_list.clear()
+        for row in db.get_history(50, search):
+            try:
+                dt = datetime.fromisoformat(row['timestamp'])
+                time_str = dt.strftime("%H:%M")
+            except:
+                time_str = ""
+            src_prev = row['source_text'][:40] + "..." if len(row['source_text']) > 40 else row['source_text']
+            trans_prev = row['translated_text'][:40] + "..." if len(row['translated_text']) > 40 else row['translated_text']
+            conf = row.get('confidence', 1.0)
+            conf_str = f" [{conf:.0%}]" if conf < 1.0 else ""
+            item_text = f"[{time_str}]{conf_str} {row['source_lang']}→{row['target_lang']} | {src_prev} ➜ {trans_prev}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, row)
+            if conf >= 0.9:
+                item.setForeground(QColor("#4CAF50"))
+            elif conf >= 0.7:
+                item.setForeground(QColor("#FFC107"))
+            else:
+                item.setForeground(QColor("#FF5722"))
+            self.history_list.addItem(item)
+    
+    def search_history(self):
+        self.refresh_history(self.search_input.text())
+    
+    def load_history_item(self, item):
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if data:
+            self.input_text.setPlainText(data['source_text'])
+            self.output_text.setPlainText(data['translated_text'])
+    
+    def export_history(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Export", str(BASE_DIR / f"history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"), "Text Files (*.txt)")
+        if filename:
+            try:
+                db.export_history(filename)
+                QMessageBox.information(self, "Success", f"Exported to:\n{filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Export failed: {e}")
+    
+    def clear_history(self):
+        if QMessageBox.question(self, "Clear", "Clear all history?") == QMessageBox.StandardButton.Yes:
+            db.clear_history()
+            self.refresh_history()
+    
+    def toggle_theme(self):
+        current = config.get("theme", "dark")
+        new = "light" if current == "dark" else "dark"
+        config.set("theme", new)
+        self.apply_theme(new)
+    
+    def apply_theme(self, theme):
+        if theme == "dark":
+            self.setStyleSheet("QMainWindow,QWidget{background:#1a1a1a;color:#e0e0e0;}QGroupBox{border:2px solid #2d2d2d;border-radius:8px;margin-top:12px;padding-top:15px;background:#222;}QGroupBox::title{left:15px;padding:0 8px;color:#64B5F6;}QTextEdit,QListWidget,QLineEdit{background:#252525;border:1px solid #3a3a3a;border-radius:6px;padding:8px;}QPushButton{background:#3a3a3a;border:1px solid #4a4a4a;border-radius:6px;padding:8px 16px;}QPushButton:hover{background:#4a4a4a;}QComboBox{background:#252525;border:1px solid #3a3a3a;border-radius:6px;padding:6px;}QStatusBar{background:#222;border-top:1px solid #3a3a3a;color:#b0b0b0;}")
+        else:
+            self.setStyleSheet("QMainWindow,QWidget{background:#f5f5f5;color:#212121;}QGroupBox{border:2px solid #e0e0e0;border-radius:8px;background:white;}QPushButton{background:white;border:1px solid #d0d0d0;border-radius:6px;padding:8px 16px;}")
+    
+    def closeEvent(self, event):
+        config.set("source_language", self.source_lang_combo.currentData())
+        config.set("target_language", self.target_lang_combo.currentData())
+        if self.recognition_thread:
+            self.recognition_thread.stop()
+            self.recognition_thread.wait()
+        tts_manager.shutdown()
+        audio_device_manager.cleanup()
+        self.overlay.close()
+        event.accept()
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Universal Live Translator Pro")
+    app.setStyle("Fusion")
+    log.info("="*60)
+    log.info("Universal Live Translator Pro v2.0")
+    log.info(f"Data: {BASE_DIR}")
+    log.info(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    log.info("="*60)
+    window = LiveTranslatorApp()
+    window.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
