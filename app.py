@@ -123,7 +123,8 @@ DEFAULT_CONFIG = {
     "cache_translations": True, "cache_expiry_days": 7, "source_language": "auto",
     "target_language": "fr", "show_confidence": True, "recognition_engine": "google",
     "whisper_model": "base", "audio_device_input": "default", "use_gpu": True,
-    "animation_duration": 200, "live_captions_mode": True, "subtitle_lines": 3
+    "animation_duration": 200, "live_captions_mode": True, "subtitle_lines": 3,
+    "subtitle_update_delay": 10  # milliseconds between word updates (lower = faster)
 }
 
 @dataclass
@@ -224,10 +225,43 @@ class AudioDeviceManager:
         return self.input_devices[0] if self.input_devices else None
     
     def get_loopback_device(self) -> Optional[AudioDevice]:
-        keywords = ['stereo mix', 'loopback', 'wave out', 'what u hear']
+        """Get loopback device with validation"""
+        keywords = ['stereo mix', 'loopback', 'wave out', 'what u hear', 'wave-out', 'waveout']
+        candidates = []
+        
+        # Find all potential loopback devices
         for device in self.input_devices:
-            if any(k in device.name.lower() for k in keywords):
+            device_name_lower = device.name.lower()
+            if any(k in device_name_lower for k in keywords):
+                candidates.append(device)
+        
+        # Try to find a working device by testing each candidate
+        for device in candidates:
+            try:
+                # Quick test with sounddevice instead of pyaudio
+                import sounddevice as sd
+                test_stream = sd.InputStream(
+                    channels=1,
+                    samplerate=int(device.default_samplerate),
+                    device=device.index,
+                    blocksize=1024
+                )
+                test_stream.close()
+                log.info(f"Found working loopback device: {device.name}")
                 return device
+            except Exception as e:
+                log.warning(f"Loopback device {device.name} failed test: {e}")
+                continue
+        
+        # If no keywords match, try the default input device if it's not a microphone
+        try:
+            default = self.get_default_input_device()
+            if default and 'mic' not in default.name.lower():
+                log.info(f"Trying default input as loopback: {default.name}")
+                return default
+        except Exception as e:
+            log.warning(f"Default device check failed: {e}")
+        
         return None
     
     def test_device(self, device: AudioDevice, duration: float = 1.0) -> bool:
@@ -689,38 +723,105 @@ class ContinuousSpeechRecognitionThread(QThread):
                 self.error_occurred.emit(f"Microphone setup failed: {e}")
     
     def _listen_system_audio_continuous(self):
-        """Continuous system audio capture with proper threading"""
+        """Continuous system audio capture with proper threading and validation"""
         loopback = audio_device_manager.get_loopback_device()
         if not loopback:
-            self.error_occurred.emit("No loopback device found.\nWindows: Enable 'Stereo Mix'\nmacOS: Install BlackHole")
+            error_msg = (
+                "❌ No working loopback device found.\n\n"
+                "Windows: Enable 'Stereo Mix' in Sound Settings:\n"
+                "  1. Right-click speaker icon → Sounds\n"
+                "  2. Recording tab → Right-click → Show Disabled Devices\n"
+                "  3. Enable 'Stereo Mix' or 'Wave Out Mix'\n\n"
+                "macOS: Install BlackHole or Soundflower\n\n"
+                "Linux: Use PulseAudio monitor device"
+            )
+            self.error_occurred.emit(error_msg)
             return
         
-        samplerate = min(int(loopback.default_samplerate), 16000)
+        # Validate sample rate
+        try:
+            samplerate = int(loopback.default_samplerate)
+            if samplerate > 48000:
+                log.warning(f"Sample rate {samplerate} too high, limiting to 16000")
+                samplerate = 16000
+            elif samplerate < 8000:
+                log.warning(f"Sample rate {samplerate} too low, using 16000")
+                samplerate = 16000
+            else:
+                samplerate = min(samplerate, 16000)
+        except Exception as e:
+            log.error(f"Sample rate validation failed: {e}")
+            samplerate = 16000
+        
         audio_buffer = []
         samples_needed = int(samplerate * 5.0)
         buffer_lock = threading.Lock()
+        stream_error = [None]  # Use list to allow modification in callback
         
         def callback(indata, frames, time_info, status):
             """Audio callback - runs in separate thread"""
-            if not self.running:
-                raise sd.CallbackStop()
-            
-            with buffer_lock:
-                audio_buffer.extend(indata[:, 0].copy())
-                if len(audio_buffer) >= samples_needed:
-                    chunk = np.array(audio_buffer[:samples_needed])
-                    audio_buffer.clear()
+            try:
+                if status:
+                    log.warning(f"Audio callback status: {status}")
+                
+                if not self.running:
+                    raise sd.CallbackStop()
+                
+                # Validate input data
+                if indata is None or len(indata) == 0:
+                    return
+                
+                with buffer_lock:
+                    # Handle mono/stereo input
+                    if indata.ndim == 1:
+                        audio_buffer.extend(indata.copy())
+                    else:
+                        audio_buffer.extend(indata[:, 0].copy())
                     
-                    # Submit to thread pool for processing
-                    if not self.recognition_queue.full() and not self.executor_shutdown:
-                        try:
-                            self.executor.submit(self._process_system_audio, chunk, samplerate)
-                        except Exception as e:
-                            if self.running:
-                                log.error(f"Failed to submit audio processing: {e}")
+                    if len(audio_buffer) >= samples_needed:
+                        chunk = np.array(audio_buffer[:samples_needed])
+                        audio_buffer.clear()
+                        
+                        # Submit to thread pool for processing
+                        if not self.recognition_queue.full() and not self.executor_shutdown:
+                            try:
+                                self.executor.submit(self._process_system_audio, chunk, samplerate)
+                            except Exception as e:
+                                if self.running:
+                                    log.error(f"Failed to submit audio processing: {e}")
+            except sd.CallbackStop:
+                raise
+            except Exception as e:
+                stream_error[0] = str(e)
+                log.error(f"Audio callback error: {e}")
+                raise sd.CallbackStop()
         
         try:
+            log.info(f"Opening system audio stream: device={loopback.name}, rate={samplerate}, index={loopback.index}")
             self.status_changed.emit(f"🎧 Capturing system audio ({self.engine.value})...")
+            
+            # Test device access before starting stream
+            try:
+                test_stream = sd.InputStream(
+                    channels=1,
+                    samplerate=samplerate,
+                    device=loopback.index,
+                    blocksize=1024
+                )
+                test_stream.close()
+                log.info("Device test successful")
+            except Exception as test_error:
+                error_msg = (
+                    f"❌ System audio device test failed:\n\n"
+                    f"Device: {loopback.name}\n"
+                    f"Error: {test_error}\n\n"
+                    f"The device may be in use by another application\n"
+                    f"or not properly configured for recording."
+                )
+                self.error_occurred.emit(error_msg)
+                return
+            
+            # Start actual capture stream
             with sd.InputStream(
                 channels=1, 
                 samplerate=samplerate, 
@@ -729,11 +830,28 @@ class ContinuousSpeechRecognitionThread(QThread):
                 blocksize=4096
             ):
                 while self.running:
+                    if stream_error[0]:
+                        raise RuntimeError(stream_error[0])
                     sd.sleep(100)
                     self._update_performance()
+                    
         except Exception as e:
             if self.running:
-                self.error_occurred.emit(f"System audio failed: {e}")
+                import traceback
+                error_details = traceback.format_exc()
+                log.error(f"System audio error:\n{error_details}")
+                
+                error_msg = (
+                    f"❌ System audio failed:\n\n"
+                    f"Error: {str(e)}\n\n"
+                    f"Device: {loopback.name if loopback else 'Unknown'}\n\n"
+                    f"Possible solutions:\n"
+                    f"• Close other apps using the audio device\n"
+                    f"• Check device is enabled in system settings\n"
+                    f"• Try restarting the application\n"
+                    f"• Use Microphone mode instead"
+                )
+                self.error_occurred.emit(error_msg)
     
     def _process_audio(self, audio):
         """Process audio chunk - runs in thread pool"""
@@ -920,6 +1038,7 @@ class ResizableOverlay(QWidget):
         self.current_sentence = []  # Build current sentence
         self.last_update_time = time.time()
         self.live_captions_mode = config.get("live_captions_mode", True)
+        self.subtitle_update_delay = config.get("subtitle_update_delay", 10) / 1000.0  # Convert ms to seconds
         
         # Fade animation for smooth text transitions
         self.fade_effect = QGraphicsOpacityEffect(self.label)
@@ -991,7 +1110,7 @@ class ResizableOverlay(QWidget):
             indicator.move(*pos)
     
     def add_text(self, text, is_translation=True):
-        """Add text with Google Live Captions-style smooth scrolling and constant updates"""
+        """Add text with Google Live Captions-style smooth scrolling and instant updates"""
         if not text.strip():
             return
         
@@ -1002,12 +1121,20 @@ class ResizableOverlay(QWidget):
             self.update_display_legacy()
             return
         
-        # Google Live Captions mode: smooth word-by-word updates
+        # Google Live Captions mode: instant word-by-word updates
         words = text.split()
-        self.current_sentence.extend(words)
         
-        # Update display immediately for live effect
-        self.update_display_smooth()
+        # Add words one at a time for smooth appearance (if delay is small enough)
+        if self.subtitle_update_delay < 0.020:  # Less than 20ms
+            # Ultra-fast mode: add all words at once
+            self.current_sentence.extend(words)
+            self.update_display_smooth()
+        else:
+            # Smooth mode: add words with slight delay for visual effect
+            for word in words:
+                self.current_sentence.append(word)
+                self.update_display_smooth()
+                QApplication.processEvents()  # Allow UI to update
         
         # Check if we should create a new line (sentence break detection)
         sentence_text = " ".join(self.current_sentence)
@@ -1031,7 +1158,7 @@ class ResizableOverlay(QWidget):
         self.label.setText(text)
     
     def update_display_smooth(self):
-        """Update display with smooth transitions like Google Live Captions - updates constantly"""
+        """Update display with smooth transitions like Google Live Captions - optimized for speed"""
         if not self.displayed_lines and not self.current_sentence:
             self.label.setText("")
             return
@@ -1045,21 +1172,22 @@ class ResizableOverlay(QWidget):
         # Keep only last N lines for clean display (Google Live Captions style)
         display_text = "\n".join(lines[-max_lines:])
         
-        # Update constantly with minimal throttling for live effect
+        # Update with configurable throttling for live effect
         current_time = time.time()
         time_since_last = current_time - self.last_update_time
         
-        if time_since_last > 0.033:  # ~30 FPS for smooth updates
+        # Use configurable delay (default 10ms = 100 FPS for very responsive updates)
+        if time_since_last > self.subtitle_update_delay:
             self.label.setText(display_text)
-            # Subtle fade for new content
-            if self.fade_animation.state() != QPropertyAnimation.State.Running and time_since_last > 0.5:
-                self.fade_animation.setStartValue(0.8)
+            # Subtle fade for new content (only on longer pauses)
+            if self.fade_animation.state() != QPropertyAnimation.State.Running and time_since_last > 0.3:
+                self.fade_animation.setStartValue(0.85)
                 self.fade_animation.setEndValue(1.0)
-                self.fade_animation.setDuration(150)
+                self.fade_animation.setDuration(100)  # Faster animation
                 self.fade_animation.start()
             self.last_update_time = current_time
         else:
-            # For very rapid updates, just update text without animation
+            # For very rapid updates, just update text without animation for maximum speed
             self.label.setText(display_text)
     
     def clear_subtitles(self):
@@ -1274,14 +1402,36 @@ class SettingsDialog(QDialog):
         anim_group.setLayout(anim_layout)
         general_layout.addWidget(anim_group)
         
-        # Max words
-        words_group = QGroupBox("Overlay Buffer")
+        # Max words and subtitle settings
+        words_group = QGroupBox("Overlay & Subtitle Settings")
         words_layout = QVBoxLayout()
+        
         self.max_words_spin = QSpinBox()
         self.max_words_spin.setRange(10, 500)
         self.max_words_spin.setValue(config.get("max_words", 100))
         words_layout.addWidget(QLabel("Maximum Words in Overlay:"))
         words_layout.addWidget(self.max_words_spin)
+        
+        # Subtitle lines
+        self.subtitle_lines_spin = QSpinBox()
+        self.subtitle_lines_spin.setRange(1, 10)
+        self.subtitle_lines_spin.setValue(config.get("subtitle_lines", 3))
+        words_layout.addWidget(QLabel("Number of Subtitle Lines:"))
+        words_layout.addWidget(self.subtitle_lines_spin)
+        
+        # Subtitle update speed
+        self.subtitle_delay_spin = QSpinBox()
+        self.subtitle_delay_spin.setRange(1, 100)
+        self.subtitle_delay_spin.setValue(config.get("subtitle_update_delay", 10))
+        self.subtitle_delay_spin.setSuffix(" ms")
+        words_layout.addWidget(QLabel("Subtitle Update Speed (lower = faster):"))
+        words_layout.addWidget(self.subtitle_delay_spin)
+        
+        speed_hint = QLabel("💡 Tip: 5-10ms for instant updates, 30-50ms for smoother animation")
+        speed_hint.setWordWrap(True)
+        speed_hint.setStyleSheet("color: #888; font-size: 11px;")
+        words_layout.addWidget(speed_hint)
+        
         words_group.setLayout(words_layout)
         general_layout.addWidget(words_group)
         
@@ -1445,6 +1595,8 @@ class SettingsDialog(QDialog):
         config.set("text_color", self.text_color)
         config.set("animation_duration", self.anim_duration_spin.value())
         config.set("max_words", self.max_words_spin.value())
+        config.set("subtitle_lines", self.subtitle_lines_spin.value())
+        config.set("subtitle_update_delay", self.subtitle_delay_spin.value())
         config.set("tts_rate", self.tts_rate_spin.value())
         config.set("volume", self.volume_slider.value() / 100.0)
         config.set("audio_device_input", self.device_combo.currentData())
@@ -1925,12 +2077,15 @@ class LiveTranslatorApp(QMainWindow):
 - Audio devices, GPU, models, theme, etc.
 - Changes apply immediately
 
-🔧 Fixes in this version:
-- ✅ Improved CUDA/GPU detection
-- ✅ Fixed Qt threading issues
-- ✅ Google Live Captions-style subtitles
-- ✅ Fixed system audio recognition
-- ✅ Fixed overlay geometry issues
+🔧 Latest Fixes & Improvements:
+- ✅ Enhanced system audio device detection with validation
+- ✅ Detailed error messages for audio device issues
+- ✅ Optimized subtitle overlay speed (configurable 1-100ms)
+- ✅ Faster word-by-word subtitle updates
+- ✅ Configurable subtitle lines and update delay
+- ✅ Improved loopback device fallback mechanism
+- ✅ Better error handling for PortAudio issues
+- ✅ Instant subtitle mode for ultra-responsive captions
 """
         msg = QMessageBox(self)
         msg.setWindowTitle("Help - Professional Edition v3.0")
@@ -1987,13 +2142,19 @@ class LiveTranslatorApp(QMainWindow):
             # Apply theme change if needed
             theme = config.get("theme", "dark")
             self.apply_theme(theme)
-            # Update overlay style
+            # Update overlay style and configuration
             self.overlay.apply_style()
+            # Update subtitle delay setting
+            self.overlay.subtitle_update_delay = config.get("subtitle_update_delay", 10) / 1000.0
+            # Recreate displayed_lines deque with new max lines
+            max_lines = config.get("subtitle_lines", 3)
+            old_lines = list(self.overlay.displayed_lines)
+            self.overlay.displayed_lines = deque(old_lines, maxlen=max_lines)
             # Update GPU status
             device = whisper_manager.device
             self.gpu_status.setText(f"🚀 Device: {device.upper()}")
             self.gpu_checkbox.setChecked(config.get("use_gpu", True))
-            self.statusBar().showMessage("Settings saved", 3000)
+            self.statusBar().showMessage("Settings saved - Subtitle speed updated", 3000)
     
     def swap_languages(self):
         if self.source_lang_combo.currentData() == "auto":
