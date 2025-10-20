@@ -123,7 +123,7 @@ DEFAULT_CONFIG = {
     "cache_translations": True, "cache_expiry_days": 7, "source_language": "auto",
     "target_language": "fr", "show_confidence": True, "recognition_engine": "google",
     "whisper_model": "base", "audio_device_input": "default", "use_gpu": True,
-    "animation_duration": 200
+    "animation_duration": 200, "live_captions_mode": True, "subtitle_lines": 3
 }
 
 @dataclass
@@ -140,10 +140,29 @@ class AudioDevice:
 class GPUManager:
     """Manages GPU detection and device selection"""
     def __init__(self):
+        # Enhanced CUDA detection
         self.has_cuda = torch.cuda.is_available()
+        if not self.has_cuda and torch.version.cuda is not None:
+            # Try to initialize CUDA even if not initially available
+            try:
+                torch.cuda.init()
+                self.has_cuda = torch.cuda.is_available()
+            except:
+                pass
+        
         self.has_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
         self.device = self._detect_device()
         self.device_name = self._get_device_name()
+        
+        # Log detailed GPU info
+        if self.has_cuda:
+            log.info(f"CUDA detected: {torch.cuda.get_device_name(0)}")
+            log.info(f"CUDA version: {torch.version.cuda}")
+            log.info(f"CUDA device count: {torch.cuda.device_count()}")
+        else:
+            log.warning("CUDA not detected. GPU acceleration disabled.")
+            if torch.version.cuda:
+                log.warning(f"PyTorch built with CUDA {torch.version.cuda} but CUDA runtime not available")
     
     def _detect_device(self):
         if self.has_cuda:
@@ -344,14 +363,17 @@ class WhisperModelManager:
         self.models = {}
         self.device = "cpu"
         self.use_gpu = config.get("use_gpu", True)
-        # Initialize device on startup
+        # Initialize device on startup - force GPU if available
         self.set_device(self.use_gpu)
+        log.info(f"WhisperModelManager initialized with device: {self.device} (use_gpu={self.use_gpu})")
     
     def set_device(self, use_gpu=True):
         self.use_gpu = use_gpu
         old_device = self.device
         self.device = gpu_manager.get_device(use_gpu)
-        log.info(f"WhisperModelManager device set to: {self.device}")
+        log.info(f"WhisperModelManager device set to: {self.device} (requested use_gpu={use_gpu})")
+        log.info(f"GPU available: {gpu_manager.is_gpu_available()}, CUDA: {gpu_manager.has_cuda}, MPS: {gpu_manager.has_mps}")
+        
         # Reload models if device changed
         if old_device != self.device and self.models:
             log.info(f"Device changed from {old_device} to {self.device}, reloading models...")
@@ -667,7 +689,7 @@ class ContinuousSpeechRecognitionThread(QThread):
                 self.error_occurred.emit(f"Microphone setup failed: {e}")
     
     def _listen_system_audio_continuous(self):
-        """Continuous system audio capture"""
+        """Continuous system audio capture with proper threading"""
         loopback = audio_device_manager.get_loopback_device()
         if not loopback:
             self.error_occurred.emit("No loopback device found.\nWindows: Enable 'Stereo Mix'\nmacOS: Install BlackHole")
@@ -676,25 +698,42 @@ class ContinuousSpeechRecognitionThread(QThread):
         samplerate = min(int(loopback.default_samplerate), 16000)
         audio_buffer = []
         samples_needed = int(samplerate * 5.0)
+        buffer_lock = threading.Lock()
         
         def callback(indata, frames, time_info, status):
+            """Audio callback - runs in separate thread"""
             if not self.running:
                 raise sd.CallbackStop()
-            audio_buffer.extend(indata[:, 0].copy())
-            if len(audio_buffer) >= samples_needed:
-                chunk = np.array(audio_buffer[:samples_needed])
-                audio_buffer.clear()
-                if not self.recognition_queue.full():
-                    self.executor.submit(self._process_system_audio, chunk, samplerate)
+            
+            with buffer_lock:
+                audio_buffer.extend(indata[:, 0].copy())
+                if len(audio_buffer) >= samples_needed:
+                    chunk = np.array(audio_buffer[:samples_needed])
+                    audio_buffer.clear()
+                    
+                    # Submit to thread pool for processing
+                    if not self.recognition_queue.full() and not self.executor_shutdown:
+                        try:
+                            self.executor.submit(self._process_system_audio, chunk, samplerate)
+                        except Exception as e:
+                            if self.running:
+                                log.error(f"Failed to submit audio processing: {e}")
         
         try:
             self.status_changed.emit(f"🎧 Capturing system audio ({self.engine.value})...")
-            with sd.InputStream(channels=1, samplerate=samplerate, device=loopback.index, callback=callback, blocksize=4096):
+            with sd.InputStream(
+                channels=1, 
+                samplerate=samplerate, 
+                device=loopback.index, 
+                callback=callback, 
+                blocksize=4096
+            ):
                 while self.running:
                     sd.sleep(100)
                     self._update_performance()
         except Exception as e:
-            self.error_occurred.emit(f"System audio failed: {e}")
+            if self.running:
+                self.error_occurred.emit(f"System audio failed: {e}")
     
     def _process_audio(self, audio):
         """Process audio chunk - runs in thread pool"""
@@ -805,12 +844,12 @@ class ContinuousSpeechRecognitionThread(QThread):
         self.executor.shutdown(wait=False)
 
 class ResizableOverlay(QWidget):
-    """Fully resizable overlay with corner and edge dragging"""
+    """Fully resizable overlay with corner and edge dragging + Google Live Captions-style scrolling"""
     
     CORNER_SIZE = 20
     EDGE_SIZE = 10
-    MIN_WIDTH = 300
-    MIN_HEIGHT = 120
+    MIN_WIDTH = 135
+    MIN_HEIGHT = 57
     
     class ResizeMode(Enum):
         NONE = 0
@@ -840,10 +879,21 @@ class ResizableOverlay(QWidget):
         self.container.setObjectName("overlayContainer")
         
         # Main content
-        self.label = QLabel("", self.container)
+        # Use a scrolling label for Google Live Captions effect
+        self.label_container = QWidget(self.container)
+        self.label_container.setMouseTracking(True)
+        
+        self.label = QLabel("", self.label_container)
         self.label.setWordWrap(True)
-        self.label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
         self.label.setMouseTracking(True)
+        self.label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        label_layout = QVBoxLayout(self.label_container)
+        label_layout.addStretch()
+        label_layout.addWidget(self.label)
+        label_layout.setContentsMargins(0, 0, 0, 0)
+        label_layout.setSpacing(0)
         
         # Resize indicators (corner dots)
         self.corner_indicators = []
@@ -855,24 +905,53 @@ class ResizableOverlay(QWidget):
             self.corner_indicators.append(indicator)
         
         layout = QVBoxLayout(self.container)
-        layout.addWidget(self.label)
+        layout.addWidget(self.label_container)
         layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(0)
         
         main = QVBoxLayout(self)
         main.addWidget(self.container)
         main.setContentsMargins(0, 0, 0, 0)
         
+        # Live captions style: show last N words with smooth scrolling
         self.text_buffer = deque(maxlen=config.get("max_words", 100))
+        max_lines = config.get("subtitle_lines", 3)
+        self.displayed_lines = deque(maxlen=max_lines)  # Show last N lines like Google Live Captions
+        self.current_sentence = []  # Build current sentence
+        self.last_update_time = time.time()
+        self.live_captions_mode = config.get("live_captions_mode", True)
         
-        # Animation for smooth transitions
-        self.animation = QPropertyAnimation(self.label, b"geometry")
-        self.animation.setDuration(config.get("animation_duration", 200))
-        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # Fade animation for smooth text transitions
+        self.fade_effect = QGraphicsOpacityEffect(self.label)
+        self.label.setGraphicsEffect(self.fade_effect)
+        
+        self.fade_animation = QPropertyAnimation(self.fade_effect, b"opacity")
+        self.fade_animation.setDuration(200)
+        self.fade_animation.setStartValue(0.0)
+        self.fade_animation.setEndValue(1.0)
+        self.fade_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         
         self.apply_style()
         geom = config.get("overlay_position", [100, 100, 800, 180])
+        # Ensure geometry is valid
+        geom = self._validate_geometry(geom)
         self.setGeometry(*geom)
         self.setVisible(config.get("overlay_visible", True))
+    
+    def _validate_geometry(self, geom):
+        """Validate and fix geometry to avoid Windows constraints errors"""
+        x, y, w, h = geom
+        
+        # Ensure minimum size
+        w = max(w, self.MIN_WIDTH)
+        h = max(h, self.MIN_HEIGHT)
+        
+        # Ensure position is on screen
+        screen = QApplication.primaryScreen().geometry()
+        x = max(0, min(x, screen.width() - w))
+        y = max(0, min(y, screen.height() - h))
+        
+        return [x, y, w, h]
         
         # Update corner positions
         self._update_corner_positions()
@@ -912,21 +991,82 @@ class ResizableOverlay(QWidget):
             indicator.move(*pos)
     
     def add_text(self, text, is_translation=True):
+        """Add text with Google Live Captions-style smooth scrolling and constant updates"""
         if not text.strip():
             return
-        for word in text.split():
-            self.text_buffer.append(word)
-        self.update_display()
+        
+        if not self.live_captions_mode:
+            # Legacy mode: just add to buffer
+            for word in text.split():
+                self.text_buffer.append(word)
+            self.update_display_legacy()
+            return
+        
+        # Google Live Captions mode: smooth word-by-word updates
+        words = text.split()
+        self.current_sentence.extend(words)
+        
+        # Update display immediately for live effect
+        self.update_display_smooth()
+        
+        # Check if we should create a new line (sentence break detection)
+        sentence_text = " ".join(self.current_sentence)
+        should_new_line = (
+            len(self.current_sentence) > 12 or  # Wrap sooner for readability
+            any(sentence_text.rstrip().endswith(punct) for punct in ['.', '!', '?', '。', '！', '？', ',', ';'])
+        )
+        
+        if should_new_line and len(self.current_sentence) > 0:
+            # Move current sentence to displayed lines with smooth transition
+            self.displayed_lines.append(sentence_text)
+            self.current_sentence = []
+            self.update_display_smooth()
     
-    def update_display(self):
+    def update_display_legacy(self):
+        """Legacy update mode (simple buffer display)"""
         if not self.text_buffer:
             self.label.setText("")
             return
         text = " ".join(list(self.text_buffer))
         self.label.setText(text)
     
+    def update_display_smooth(self):
+        """Update display with smooth transitions like Google Live Captions - updates constantly"""
+        if not self.displayed_lines and not self.current_sentence:
+            self.label.setText("")
+            return
+        
+        # Build display text: show last N completed lines + current building sentence
+        max_lines = config.get("subtitle_lines", 3)
+        lines = list(self.displayed_lines)
+        if self.current_sentence:
+            lines.append(" ".join(self.current_sentence))
+        
+        # Keep only last N lines for clean display (Google Live Captions style)
+        display_text = "\n".join(lines[-max_lines:])
+        
+        # Update constantly with minimal throttling for live effect
+        current_time = time.time()
+        time_since_last = current_time - self.last_update_time
+        
+        if time_since_last > 0.033:  # ~30 FPS for smooth updates
+            self.label.setText(display_text)
+            # Subtle fade for new content
+            if self.fade_animation.state() != QPropertyAnimation.State.Running and time_since_last > 0.5:
+                self.fade_animation.setStartValue(0.8)
+                self.fade_animation.setEndValue(1.0)
+                self.fade_animation.setDuration(150)
+                self.fade_animation.start()
+            self.last_update_time = current_time
+        else:
+            # For very rapid updates, just update text without animation
+            self.label.setText(display_text)
+    
     def clear_subtitles(self):
+        """Clear all subtitle text"""
         self.text_buffer.clear()
+        self.displayed_lines.clear()
+        self.current_sentence = []
         self.label.setText("")
     
     def _get_resize_mode(self, pos):
@@ -1019,26 +1159,38 @@ class ResizableOverlay(QWidget):
         elif self.resize_mode == self.ResizeMode.RIGHT:
             geom.setRight(geom.right() + delta.x())
         
-        # Enforce minimum size
-        if geom.width() < self.MIN_WIDTH:
+        # Enforce minimum size with more flexible constraints
+        min_w = max(self.MIN_WIDTH, 135)
+        min_h = max(self.MIN_HEIGHT, 57)
+        
+        if geom.width() < min_w:
             if self.resize_mode in [self.ResizeMode.LEFT, self.ResizeMode.TOP_LEFT, self.ResizeMode.BOTTOM_LEFT]:
-                geom.setLeft(geom.right() - self.MIN_WIDTH)
+                geom.setLeft(geom.right() - min_w)
             else:
-                geom.setWidth(self.MIN_WIDTH)
+                geom.setWidth(min_w)
         
-        if geom.height() < self.MIN_HEIGHT:
+        if geom.height() < min_h:
             if self.resize_mode in [self.ResizeMode.TOP, self.ResizeMode.TOP_LEFT, self.ResizeMode.TOP_RIGHT]:
-                geom.setTop(geom.bottom() - self.MIN_HEIGHT)
+                geom.setTop(geom.bottom() - min_h)
             else:
-                geom.setHeight(self.MIN_HEIGHT)
+                geom.setHeight(min_h)
         
-        self.setGeometry(geom)
+        # Validate geometry before setting to avoid Windows errors
+        if geom.width() >= self.MIN_WIDTH and geom.height() >= self.MIN_HEIGHT:
+            try:
+                self.setGeometry(geom)
+            except Exception as e:
+                log.debug(f"Geometry set failed: {e}")
+                # Fall back to current geometry if setting fails
+                pass
         self._update_corner_positions()
     
     def mouseReleaseEvent(self, e):
         if self.resize_mode != self.ResizeMode.NONE:
             geom = self.geometry()
-            config.set("overlay_position", [geom.x(), geom.y(), geom.width(), geom.height()])
+            # Validate and save geometry
+            validated_geom = self._validate_geometry([geom.x(), geom.y(), geom.width(), geom.height()])
+            config.set("overlay_position", validated_geom)
             
             # Hide corner indicators
             for indicator in self.corner_indicators:
@@ -1738,15 +1890,19 @@ class LiveTranslatorApp(QMainWindow):
 - Async processing queue - no blocking
 - Parallel recognition and translation
 
-📺 Resizable Overlay
+📺 Google Live Captions-Style Overlay
+- Real-time word-by-word updates
+- Smooth scrolling transitions
+- Shows last 3 lines of text
+- Auto-wrapping at sentence breaks
 - Drag corners: Resize diagonally
 - Drag edges: Resize in one direction  
 - Drag center: Move window
-- Min size: 300x120
 
-🚀 GPU Acceleration
+🚀 GPU Acceleration (Enhanced)
 - Current Status: {gpu_manager.device_name}
 - Device: {gpu_manager.device}
+- CUDA: {'✅ Available' if gpu_manager.has_cuda else '❌ Not detected'}
 - 10-20x faster Whisper transcription
 - Configure in Settings (⚙️)
 
@@ -1768,6 +1924,13 @@ class LiveTranslatorApp(QMainWindow):
 - All settings now editable in Settings dialog
 - Audio devices, GPU, models, theme, etc.
 - Changes apply immediately
+
+🔧 Fixes in this version:
+- ✅ Improved CUDA/GPU detection
+- ✅ Fixed Qt threading issues
+- ✅ Google Live Captions-style subtitles
+- ✅ Fixed system audio recognition
+- ✅ Fixed overlay geometry issues
 """
         msg = QMessageBox(self)
         msg.setWindowTitle("Help - Professional Edition v3.0")
@@ -1871,12 +2034,12 @@ class LiveTranslatorApp(QMainWindow):
         self.recognition_thread = ContinuousSpeechRecognitionThread(
             self.source_type, src_lang, self.recognition_engine, device_idx
         )
-        self.recognition_thread.phrase_detected.connect(self.handle_phrase)
-        self.recognition_thread.status_changed.connect(lambda s: self.statusBar().showMessage(s))
+        self.recognition_thread.phrase_detected.connect(self.handle_phrase, Qt.ConnectionType.QueuedConnection)
+        self.recognition_thread.status_changed.connect(self.update_status_safe, Qt.ConnectionType.QueuedConnection)
         self.recognition_thread.error_occurred.connect(
-            lambda e: QMessageBox.warning(self, "Error", e) or self.stop_listening()
+            self.handle_recognition_error, Qt.ConnectionType.QueuedConnection
         )
-        self.recognition_thread.performance_update.connect(self.update_performance)
+        self.recognition_thread.performance_update.connect(self.update_performance, Qt.ConnectionType.QueuedConnection)
         self.recognition_thread.start()
         
         self.listen_btn.setText("⏹️ Stop Continuous Listening")
@@ -1900,8 +2063,21 @@ class LiveTranslatorApp(QMainWindow):
             self.stop_listening()
             QTimer.singleShot(500, self.start_listening)
     
+    def update_status_safe(self, message):
+        """Thread-safe status update"""
+        QMetaObject.invokeMethod(
+            self.statusBar(), "showMessage",
+            Qt.ConnectionType.QueuedConnection,
+            Q_ARG(str, message)
+        )
+    
+    def handle_recognition_error(self, error_msg):
+        """Thread-safe error handling"""
+        QMessageBox.warning(self, "Error", error_msg)
+        self.stop_listening()
+    
     def update_performance(self, perf_data):
-        """Update performance indicators"""
+        """Update performance indicators (called from signal, already thread-safe)"""
         avg_time = perf_data.get('avg_processing_time', 0)
         rec_queue = perf_data.get('recognition_queue', 0)
         trans_queue = perf_data.get('translation_queue', 0)
