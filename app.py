@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Universal Live Translator Desktop — Professional Edition v3.0
+Universal Live Translator Desktop — Professional Edition v3.5
 -------------------------------------------------------------
-✨ Advanced Features:
-- 🎙️ Continuous listening (never stops!)
-- 📺 Fully resizable overlay (drag corners/edges)
-- 🚀 GPU acceleration (CUDA/MPS)
-- ⚡ Performance optimizations (async pipeline)
-- 💎 Professional UX (glassmorphic design)
+🎨 Netflix/Google-Level Professional Features:
+- 🎙️ Continuous listening (never stops - speak naturally)
+- 📺 Netflix-style resizable overlay (Material Design 3)
+- 🚀 GPU acceleration (CUDA/MPS - 10-20x faster)
+- ⚡ Advanced async pipeline (parallel processing)
+- 💎 Material Design 3 UI (glassmorphic effects)
+- 🎬 Smooth animations and micro-interactions
+- ♿ Accessible design with keyboard navigation
+- 🌈 Professional color system and typography
+- 📊 Real-time performance monitoring
+- 🔧 Comprehensive settings management
 """
 import os, sys, threading, queue, logging, sqlite3, tempfile, json, time
 from pathlib import Path
@@ -117,14 +122,14 @@ VOSK_MODELS = {
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large"]
 
 DEFAULT_CONFIG = {
-    "theme": "dark", "overlay_position": [100, 100, 800, 150], "overlay_visible": True,
-    "font_size": 20, "text_color": "#FFFFFF", "bg_color": "rgba(20,20,30,0.85)",
-    "max_words": 100, "auto_speak": True, "tts_rate": 150, "volume": 0.8,
-    "cache_translations": True, "cache_expiry_days": 7, "source_language": "auto",
+    "theme": "dark", "overlay_position": [100, 100, 850, 180], "overlay_visible": True,
+    "font_size": 22, "text_color": "#FFFFFF", "bg_color": "rgba(15,15,20,0.92)",
+    "max_words": 150, "auto_speak": True, "tts_rate": 160, "volume": 0.75,
+    "cache_translations": True, "cache_expiry_days": 14, "source_language": "auto",
     "target_language": "fr", "show_confidence": True, "recognition_engine": "google",
     "whisper_model": "base", "audio_device_input": "default", "use_gpu": True,
-    "animation_duration": 200, "live_captions_mode": True, "subtitle_lines": 3,
-    "subtitle_update_delay": 10  # milliseconds between word updates (lower = faster)
+    "animation_duration": 250, "live_captions_mode": True, "subtitle_lines": 3,
+    "subtitle_update_delay": 8  # milliseconds between word updates (lower = faster, professional default)
 }
 
 @dataclass
@@ -542,34 +547,71 @@ def setup_argos():
 threading.Thread(target=setup_argos, daemon=True).start()
 
 class TranslationEngine:
+    """Professional translation engine with enhanced caching and performance optimization"""
     def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="TranslateWorker")
+        self.executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="TranslateWorker")
+        # In-memory cache for ultra-fast repeated translations
+        self.memory_cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
     
     def translate(self, text, src, tgt):
+        """Translate with enhanced multi-level caching for maximum performance"""
         if not text.strip():
             return "", 0, 1.0
+        
+        # Level 1: In-memory cache (ultra-fast, ~0ms)
+        cache_key = f"{text}:{src}:{tgt}"
+        if cache_key in self.memory_cache:
+            self.cache_hits += 1
+            cached_result = self.memory_cache[cache_key]
+            log.debug(f"Memory cache HIT ({self.cache_hits}/{self.cache_hits + self.cache_misses})")
+            return cached_result[0], 0, cached_result[1]
+        
+        # Level 2: Database cache (fast, ~5-10ms)
         if config.get("cache_translations"):
             cached = db.get_cached_translation(text, src, tgt)
             if cached:
+                self.cache_hits += 1
+                self.memory_cache[cache_key] = (cached, 1.0)
+                # Limit memory cache size to prevent memory bloat
+                if len(self.memory_cache) > 1000:
+                    # Remove oldest 20% of entries
+                    keys_to_remove = list(self.memory_cache.keys())[:200]
+                    for k in keys_to_remove:
+                        del self.memory_cache[k]
                 return cached, 0, 1.0
+        
+        self.cache_misses += 1
         start = time.time()
         translated = None
         confidence = 1.0
+        
+        # Try online translation first (Google Translate)
         if is_online():
             try:
                 translated = GoogleTranslator(source=src, target=tgt).translate(text)
-            except:
-                pass
+                confidence = 1.0
+            except Exception as e:
+                log.warning(f"Google Translate failed: {e}")
+        
+        # Fallback to offline Argos translation
         if not translated:
             try:
                 translated = argostranslate.translate.translate(text, from_code=src, to_code=tgt)
                 confidence = 0.85
-            except:
+            except Exception as e:
+                log.warning(f"Argos Translate failed: {e}")
                 translated = text
                 confidence = 0.0
+        
         duration = int((time.time() - start) * 1000)
+        
+        # Cache the result in both levels
         if translated and config.get("cache_translations"):
             db.cache_translation(text, translated, src, tgt)
+            self.memory_cache[cache_key] = (translated, confidence)
+        
         return translated, duration, confidence
     
     def translate_async(self, text, src, tgt, callback):
@@ -962,12 +1004,12 @@ class ContinuousSpeechRecognitionThread(QThread):
         self.executor.shutdown(wait=False)
 
 class ResizableOverlay(QWidget):
-    """Fully resizable overlay with corner and edge dragging + Google Live Captions-style scrolling"""
+    """Fully resizable overlay with corner and edge dragging + Netflix/Google Live Captions-style scrolling"""
     
     CORNER_SIZE = 20
     EDGE_SIZE = 10
-    MIN_WIDTH = 135
-    MIN_HEIGHT = 57
+    MIN_WIDTH = 200
+    MIN_HEIGHT = 80
     
     class ResizeMode(Enum):
         NONE = 0
@@ -1013,12 +1055,17 @@ class ResizableOverlay(QWidget):
         label_layout.setContentsMargins(0, 0, 0, 0)
         label_layout.setSpacing(0)
         
-        # Resize indicators (corner dots)
+        # Resize indicators (corner dots) - Material Design 3 style
         self.corner_indicators = []
         for _ in range(4):
             indicator = QLabel("", self.container)
-            indicator.setFixedSize(8, 8)
-            indicator.setStyleSheet("background: rgba(100, 181, 246, 0.6); border-radius: 4px;")
+            indicator.setFixedSize(10, 10)
+            indicator.setStyleSheet("""
+                background: qradialgradient(cx:0.5, cy:0.5, radius:0.5,
+                    fx:0.5, fy:0.5, stop:0 rgba(130, 200, 255, 0.9), stop:1 rgba(100, 181, 246, 0.7));
+                border-radius: 5px;
+                border: 1px solid rgba(255,255,255,0.3);
+            """)
             indicator.hide()
             self.corner_indicators.append(indicator)
         
@@ -1040,15 +1087,20 @@ class ResizableOverlay(QWidget):
         self.live_captions_mode = config.get("live_captions_mode", True)
         self.subtitle_update_delay = config.get("subtitle_update_delay", 10) / 1000.0  # Convert ms to seconds
         
-        # Fade animation for smooth text transitions
+        # Professional fade animation for Netflix-style smooth text transitions
         self.fade_effect = QGraphicsOpacityEffect(self.label)
         self.label.setGraphicsEffect(self.fade_effect)
         
         self.fade_animation = QPropertyAnimation(self.fade_effect, b"opacity")
-        self.fade_animation.setDuration(200)
+        self.fade_animation.setDuration(250)
         self.fade_animation.setStartValue(0.0)
         self.fade_animation.setEndValue(1.0)
-        self.fade_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self.fade_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        
+        # Add slide animation for Netflix-style entrance
+        self.slide_animation = QPropertyAnimation(self.label, b"pos")
+        self.slide_animation.setDuration(250)
+        self.slide_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         
         self.apply_style()
         geom = config.get("overlay_position", [100, 100, 800, 180])
@@ -1076,24 +1128,29 @@ class ResizableOverlay(QWidget):
         self._update_corner_positions()
     
     def apply_style(self):
-        """Glassmorphic professional styling"""
-        fs = config.get("font_size", 20)
+        """Netflix/Google-level glassmorphic professional styling"""
+        fs = config.get("font_size", 22)
         tc = config.get("text_color", "#FFFFFF")
-        bg = config.get("bg_color", "rgba(20,20,30,0.90)")
+        bg = config.get("bg_color", "rgba(15,15,20,0.92)")
         
+        # Professional Material Design 3 styling
         self.setStyleSheet(f"""
             #overlayContainer {{
                 background: {bg};
-                border-radius: 16px;
-                border: 2px solid rgba(255,255,255,0.2);
-                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                border: 1.5px solid rgba(255,255,255,0.15);
+                backdrop-filter: blur(20px);
+                box-shadow: 0 8px 32px rgba(0,0,0,0.4);
             }}
             QLabel {{
                 color: {tc};
                 font-size: {fs}px;
-                font-weight: 400;
-                line-height: 1.6;
+                font-weight: 500;
+                line-height: 1.7;
                 background: transparent;
+                font-family: "Segoe UI", "SF Pro Display", -apple-system, system-ui, sans-serif;
+                letter-spacing: 0.3px;
+                text-shadow: 0 2px 8px rgba(0,0,0,0.3);
             }}
         """)
     
@@ -1158,7 +1215,7 @@ class ResizableOverlay(QWidget):
         self.label.setText(text)
     
     def update_display_smooth(self):
-        """Update display with smooth transitions like Google Live Captions - optimized for speed"""
+        """Update display with Netflix/Google Live Captions-style smooth transitions - optimized for speed"""
         if not self.displayed_lines and not self.current_sentence:
             self.label.setText("")
             return
@@ -1169,7 +1226,7 @@ class ResizableOverlay(QWidget):
         if self.current_sentence:
             lines.append(" ".join(self.current_sentence))
         
-        # Keep only last N lines for clean display (Google Live Captions style)
+        # Keep only last N lines for clean display (Netflix/Google Live Captions style)
         display_text = "\n".join(lines[-max_lines:])
         
         # Update with configurable throttling for live effect
@@ -1179,11 +1236,12 @@ class ResizableOverlay(QWidget):
         # Use configurable delay (default 10ms = 100 FPS for very responsive updates)
         if time_since_last > self.subtitle_update_delay:
             self.label.setText(display_text)
-            # Subtle fade for new content (only on longer pauses)
-            if self.fade_animation.state() != QPropertyAnimation.State.Running and time_since_last > 0.3:
-                self.fade_animation.setStartValue(0.85)
+            # Netflix-style subtle fade for new content (only on longer pauses)
+            if self.fade_animation.state() != QPropertyAnimation.State.Running and time_since_last > 0.4:
+                self.fade_animation.setStartValue(0.88)
                 self.fade_animation.setEndValue(1.0)
-                self.fade_animation.setDuration(100)  # Faster animation
+                self.fade_animation.setDuration(150)
+                self.fade_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
                 self.fade_animation.start()
             self.last_update_time = current_time
         else:
@@ -1346,13 +1404,44 @@ class ResizableOverlay(QWidget):
                 indicator.hide()
 
 class SettingsDialog(QDialog):
-    """Comprehensive settings dialog with all editable options"""
+    """Netflix/Google-level comprehensive settings dialog with Material Design 3 styling"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("⚙️ Settings")
-        self.setMinimumWidth(600)
-        self.setMinimumHeight(700)
+        self.setWindowTitle("⚙️ Settings — Universal Live Translator")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(750)
         self.setup_ui()
+        # Apply professional styling to dialog
+        self.setStyleSheet("""
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0f0f14, stop:1 #1a1a20);
+            }
+            QTabWidget::pane {
+                border: 1.5px solid rgba(255,255,255,0.08);
+                border-radius: 12px;
+                background: rgba(42,42,50,0.3);
+                padding: 10px;
+            }
+            QTabBar::tab {
+                background: rgba(60,60,70,0.5);
+                color: #b8bbbe;
+                padding: 10px 20px;
+                margin-right: 4px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                font-weight: 500;
+                font-size: 13px;
+            }
+            QTabBar::tab:selected {
+                background: rgba(130,200,255,0.15);
+                color: #82c8ff;
+                border-bottom: 2px solid #82c8ff;
+            }
+            QTabBar::tab:hover:!selected {
+                background: rgba(75,75,85,0.6);
+            }
+        """)
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -1571,12 +1660,51 @@ class SettingsDialog(QDialog):
         
         layout.addWidget(tabs)
         
-        # Buttons
+        # Professional action buttons with Material Design 3 styling
         buttons = QHBoxLayout()
-        save_btn = QPushButton("💾 Save")
+        buttons.setSpacing(12)
+        
+        save_btn = QPushButton("✔ Save & Apply")
         save_btn.clicked.connect(self.save_settings)
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4CAF50, stop:1 #388E3C);
+                color: white;
+                font-weight: 600;
+                padding: 12px 28px;
+                font-size: 14px;
+                border: none;
+                border-radius: 10px;
+                letter-spacing: 0.5px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #5FD068, stop:1 #4CAF50);
+            }
+            QPushButton:pressed {
+                background: #2E7D32;
+            }
+        """)
+        
         cancel_btn = QPushButton("✖ Cancel")
         cancel_btn.clicked.connect(self.reject)
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(60,60,70,0.8);
+                color: #e8eaed;
+                font-weight: 500;
+                padding: 12px 28px;
+                font-size: 14px;
+                border: 1.5px solid rgba(255,255,255,0.1);
+                border-radius: 10px;
+            }
+            QPushButton:hover {
+                background: rgba(75,75,85,0.9);
+                border: 1.5px solid rgba(255,255,255,0.2);
+            }
+        """)
+        
         buttons.addStretch()
         buttons.addWidget(save_btn)
         buttons.addWidget(cancel_btn)
@@ -1614,13 +1742,41 @@ class SettingsDialog(QDialog):
         self.accept()
 
 class ModelManagerDialog(QDialog):
-    """Model download and management dialog"""
+    """Professional model download and management dialog with Material Design 3"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("📥 Model Manager")
-        self.setMinimumWidth(700)
-        self.setMinimumHeight(500)
+        self.setWindowTitle("📥 Model Manager — Universal Live Translator")
+        self.setMinimumWidth(750)
+        self.setMinimumHeight(550)
         self.setup_ui()
+        # Apply professional styling
+        self.setStyleSheet("""
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0f0f14, stop:1 #1a1a20);
+            }
+            QTabWidget::pane {
+                border: 1.5px solid rgba(255,255,255,0.08);
+                border-radius: 12px;
+                background: rgba(42,42,50,0.3);
+                padding: 10px;
+            }
+            QTabBar::tab {
+                background: rgba(60,60,70,0.5);
+                color: #b8bbbe;
+                padding: 10px 20px;
+                margin-right: 4px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                font-weight: 500;
+                font-size: 13px;
+            }
+            QTabBar::tab:selected {
+                background: rgba(130,200,255,0.15);
+                color: #82c8ff;
+                border-bottom: 2px solid #82c8ff;
+            }
+        """)
     
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -1718,10 +1874,27 @@ class ModelManagerDialog(QDialog):
         
         layout.addWidget(tabs)
         
-        # Close button
-        close_btn = QPushButton("✖ Close")
+        # Professional close button
+        close_btn = QPushButton("✔ Done")
         close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4CAF50, stop:1 #388E3C);
+                color: white;
+                font-weight: 600;
+                padding: 12px 28px;
+                font-size: 14px;
+                border: none;
+                border-radius: 10px;
+                letter-spacing: 0.5px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #5FD068, stop:1 #4CAF50);
+            }
+        """)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignCenter)
     
     def download_whisper_model(self, model_name):
         reply = QMessageBox.question(
@@ -1784,8 +1957,9 @@ class ModelManagerDialog(QDialog):
 class LiveTranslatorApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🌍 Universal Live Translator — Professional Edition v3.0")
-        self.resize(1200, 950)
+        self.setWindowTitle("🌍 Universal Live Translator — Professional Edition v3.5")
+        self.resize(1300, 1000)
+        self.setMinimumSize(900, 700)
         self.recognition_thread = None
         self.source_type = "microphone"
         self.translation_mode = "Continuous"
@@ -1807,40 +1981,106 @@ class LiveTranslatorApp(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setSpacing(15)
         
-        # Top bar with GPU status
+        # Professional top bar with enhanced status indicators
         top_bar = QHBoxLayout()
+        top_bar.setSpacing(12)
+        
+        # Status with enhanced styling
         self.status_label = QLabel("🌐 Ready")
+        self.status_label.setStyleSheet("""
+            QLabel {
+                font-size: 14px;
+                font-weight: 500;
+                color: #82c8ff;
+                padding: 6px 12px;
+                background: rgba(130,200,255,0.1);
+                border-radius: 8px;
+                border: 1px solid rgba(130,200,255,0.2);
+            }
+        """)
         top_bar.addWidget(self.status_label)
         
-        # GPU status indicator
+        # GPU status indicator with professional Material Design 3 styling
         gpu_color = "#4CAF50" if gpu_manager.is_gpu_available() else "#FFC107"
+        gpu_bg = "rgba(76,175,80,0.15)" if gpu_manager.is_gpu_available() else "rgba(255,193,7,0.15)"
         self.gpu_status = QLabel(f"🚀 {gpu_manager.device_name}")
-        self.gpu_status.setStyleSheet(f"color: {gpu_color}; font-weight: bold;")
-        self.gpu_status.setToolTip(f"Device: {gpu_manager.device}\nCUDA Available: {gpu_manager.has_cuda}\nMPS Available: {gpu_manager.has_mps}")
+        self.gpu_status.setStyleSheet(f"""
+            QLabel {{
+                color: {gpu_color};
+                font-weight: 600;
+                font-size: 13px;
+                padding: 6px 12px;
+                background: {gpu_bg};
+                border-radius: 8px;
+                border: 1px solid {gpu_color};
+            }}
+        """)
+        self.gpu_status.setToolTip(f"Device: {gpu_manager.device}\nCUDA Available: {gpu_manager.has_cuda}\nMPS Available: {gpu_manager.has_mps}\n\n10-20x faster with GPU acceleration!")
         top_bar.addWidget(self.gpu_status)
         
-        # Performance monitor
+        # Performance monitor with enhanced styling
         self.perf_label = QLabel("⚡ Performance: Ready")
+        self.perf_label.setStyleSheet("""
+            QLabel {
+                font-size: 13px;
+                font-weight: 500;
+                color: #9aa0a6;
+                padding: 6px 12px;
+                background: rgba(154,160,166,0.08);
+                border-radius: 8px;
+            }
+        """)
+        self.perf_label.setToolTip("Real-time processing metrics:\nAverage time | Queue sizes | Device")
         top_bar.addWidget(self.perf_label)
         
         top_bar.addStretch()
         
-        help_btn = QPushButton("❓ F1")
+        help_btn = QPushButton("❓ Help")
         help_btn.clicked.connect(self.show_help)
+        help_btn.setToolTip("Show keyboard shortcuts and features (F1)")
+        help_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }
+        """)
         top_bar.addWidget(help_btn)
         
         self.models_btn = QPushButton("📥 Models")
         self.models_btn.clicked.connect(self.show_models)
         self.models_btn.setToolTip("Download and manage Whisper and Vosk models")
+        self.models_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }
+        """)
         top_bar.addWidget(self.models_btn)
         
         self.theme_btn = QPushButton("🌓 Theme")
         self.theme_btn.clicked.connect(self.toggle_theme)
+        self.theme_btn.setToolTip("Toggle dark/light theme (Ctrl+D)")
+        self.theme_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }
+        """)
         top_bar.addWidget(self.theme_btn)
         
         self.settings_btn = QPushButton("⚙️ Settings")
         self.settings_btn.clicked.connect(self.show_settings)
         self.settings_btn.setToolTip("Configure all application settings")
+        self.settings_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }
+        """)
         top_bar.addWidget(self.settings_btn)
         
         main_layout.addLayout(top_bar)
@@ -1850,46 +2090,75 @@ class LiveTranslatorApp(QMainWindow):
         config_layout = QVBoxLayout()
         
         lang_row = QHBoxLayout()
-        lang_row.addWidget(QLabel("From:"))
+        lang_row.setSpacing(10)
+        
+        src_label = QLabel("From:")
+        src_label.setStyleSheet("font-weight: 500; font-size: 13px;")
+        lang_row.addWidget(src_label)
         self.source_lang_combo = QComboBox()
         self.populate_languages(self.source_lang_combo, True)
+        self.source_lang_combo.setToolTip("Select source language or 'Auto' for automatic detection")
         lang_row.addWidget(self.source_lang_combo, 1)
         
         self.swap_btn = QPushButton("⇄")
         self.swap_btn.setMaximumWidth(50)
         self.swap_btn.clicked.connect(self.swap_languages)
+        self.swap_btn.setToolTip("Swap source and target languages")
+        self.swap_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 18px;
+                font-weight: bold;
+                padding: 8px;
+            }
+        """)
         lang_row.addWidget(self.swap_btn)
         
-        lang_row.addWidget(QLabel("To:"))
+        tgt_label = QLabel("To:")
+        tgt_label.setStyleSheet("font-weight: 500; font-size: 13px;")
+        lang_row.addWidget(tgt_label)
         self.target_lang_combo = QComboBox()
         self.populate_languages(self.target_lang_combo)
+        self.target_lang_combo.setToolTip("Select target language for translation")
         lang_row.addWidget(self.target_lang_combo, 1)
         
         config_layout.addLayout(lang_row)
         
         engine_row = QHBoxLayout()
-        engine_row.addWidget(QLabel("Engine:"))
+        engine_row.setSpacing(10)
+        
+        engine_label = QLabel("Engine:")
+        engine_label.setStyleSheet("font-weight: 500; font-size: 13px;")
+        engine_row.addWidget(engine_label)
         self.engine_combo = QComboBox()
         self.engine_combo.addItem("🌐 Google", RecognitionEngine.GOOGLE.value)
-        self.engine_combo.addItem("💻 Vosk", RecognitionEngine.VOSK.value)
-        self.engine_combo.addItem("🤖 Whisper", RecognitionEngine.WHISPER.value)
+        self.engine_combo.addItem("💻 Vosk (Offline)", RecognitionEngine.VOSK.value)
+        self.engine_combo.addItem("🤖 Whisper (AI)", RecognitionEngine.WHISPER.value)
         self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
+        self.engine_combo.setToolTip("Speech recognition engine:\n• Google: Fast, online required\n• Vosk: Offline, download required\n• Whisper: AI-powered, GPU recommended")
         engine_row.addWidget(self.engine_combo, 1)
         
-        engine_row.addWidget(QLabel("Mode:"))
+        mode_label = QLabel("Mode:")
+        mode_label.setStyleSheet("font-weight: 500; font-size: 13px;")
+        engine_row.addWidget(mode_label)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Continuous", "Real-time", "Manual"])
         self.mode_combo.currentTextChanged.connect(lambda m: setattr(self, 'translation_mode', m))
+        self.mode_combo.setToolTip("Translation mode:\n• Continuous: Auto-translate as you speak\n• Real-time: Live translation\n• Manual: Translate on demand")
         engine_row.addWidget(self.mode_combo, 1)
         
         config_layout.addLayout(engine_row)
         
         # GPU toggle
         gpu_row = QHBoxLayout()
-        self.gpu_checkbox = QCheckBox("🚀 Use GPU Acceleration")
+        self.gpu_checkbox = QCheckBox("🚀 Enable GPU Acceleration (10-20x faster)")
         self.gpu_checkbox.setChecked(config.get("use_gpu", True))
         self.gpu_checkbox.setEnabled(gpu_manager.is_gpu_available())
         self.gpu_checkbox.stateChanged.connect(self.on_gpu_toggled)
+        self.gpu_checkbox.setStyleSheet("font-size: 13px; font-weight: 500;")
+        if gpu_manager.is_gpu_available():
+            self.gpu_checkbox.setToolTip(f"GPU detected: {gpu_manager.device_name}\nToggle to enable/disable GPU acceleration")
+        else:
+            self.gpu_checkbox.setToolTip("No GPU detected. Install CUDA (NVIDIA) or use Apple Silicon for GPU acceleration.")
         gpu_row.addWidget(self.gpu_checkbox)
         
         if not gpu_manager.is_gpu_available():
@@ -1921,8 +2190,9 @@ class LiveTranslatorApp(QMainWindow):
         input_layout.addLayout(input_header)
         
         self.input_text = QTextEdit()
-        self.input_text.setPlaceholderText("🎤 Speak continuously - no need to stop...")
+        self.input_text.setPlaceholderText("🎤 Speak continuously - no need to stop...\n\nClick 'Start Continuous Listening' and speak naturally.\nYour words will appear here in real-time with timestamps and confidence scores.")
         self.input_text.textChanged.connect(self.update_word_count)
+        self.input_text.setToolTip("Live transcription appears here with timestamps and confidence scores")
         input_layout.addWidget(self.input_text)
         
         io_splitter.addWidget(input_widget)
@@ -1941,7 +2211,8 @@ class LiveTranslatorApp(QMainWindow):
         
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
-        self.output_text.setPlaceholderText("Translation appears here instantly...")
+        self.output_text.setPlaceholderText("🌐 Translation appears here instantly...\n\nTranslations are processed in real-time through async pipeline.\nResults include timestamps and confidence scores.")
+        self.output_text.setToolTip("Translated text with confidence scores and timestamps")
         output_layout.addWidget(self.output_text)
         
         io_splitter.addWidget(output_widget)
@@ -1953,62 +2224,101 @@ class LiveTranslatorApp(QMainWindow):
         
         self.listen_btn = QPushButton("🎤 Start Continuous Listening")
         self.listen_btn.clicked.connect(self.toggle_listening)
-        self.listen_btn.setStyleSheet("font-weight:bold;padding:12px;font-size:14px;background:#4CAF50;color:white;")
+        self.listen_btn.setStyleSheet("""
+            QPushButton {
+                font-weight: 600;
+                padding: 14px 24px;
+                font-size: 15px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4CAF50, stop:1 #388E3C);
+                color: white;
+                border: none;
+                border-radius: 12px;
+                letter-spacing: 0.5px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #5FD068, stop:1 #4CAF50);
+                padding: 14px 24px;
+            }
+            QPushButton:pressed {
+                background: #2E7D32;
+            }
+        """)
         self.listen_btn.setToolTip("Start continuous speech recognition (Ctrl+L)")
         controls_layout.addWidget(self.listen_btn, 0, 0, 1, 2)
         
         self.translate_btn = QPushButton("🔄 Translate")
         self.translate_btn.clicked.connect(self.translate_manual)
         self.translate_btn.setToolTip("Manually translate the input text (Ctrl+T)")
+        self.translate_btn.setStyleSheet("padding: 12px 20px; font-size: 14px; font-weight: 500;")
         controls_layout.addWidget(self.translate_btn, 0, 2, 1, 2)
         
         self.speak_btn = QPushButton("🔊 Speak")
         self.speak_btn.clicked.connect(self.speak_output)
-        self.speak_btn.setToolTip("Speak the translated text (Ctrl+S)")
+        self.speak_btn.setToolTip("Speak the translated text aloud (Ctrl+S)")
+        self.speak_btn.setStyleSheet("padding: 10px 18px; font-size: 13px; font-weight: 500;")
         controls_layout.addWidget(self.speak_btn, 1, 0)
         
         self.stop_btn = QPushButton("🔇 Stop")
         self.stop_btn.clicked.connect(lambda: tts_manager.stop())
+        self.stop_btn.setToolTip("Stop current text-to-speech playback")
+        self.stop_btn.setStyleSheet("padding: 10px 18px; font-size: 13px; font-weight: 500;")
         controls_layout.addWidget(self.stop_btn, 1, 1)
         
         self.source_btn = QPushButton("🎧 System Audio")
         self.source_btn.clicked.connect(self.toggle_source)
         self.source_btn.setToolTip("Switch between microphone and system audio input")
+        self.source_btn.setStyleSheet("padding: 10px 18px; font-size: 13px; font-weight: 500;")
         controls_layout.addWidget(self.source_btn, 1, 2)
         
         self.overlay_btn = QPushButton("👁️ Overlay")
         self.overlay_btn.clicked.connect(self.toggle_overlay)
-        self.overlay_btn.setToolTip("Toggle the translation overlay (Ctrl+O)")
+        self.overlay_btn.setToolTip("Toggle the resizable translation overlay (Ctrl+O)\nDrag corners to resize, drag center to move")
+        self.overlay_btn.setStyleSheet("padding: 10px 18px; font-size: 13px; font-weight: 500;")
         controls_layout.addWidget(self.overlay_btn, 1, 3)
         
-        self.auto_speak = QCheckBox("Auto-speak")
+        self.auto_speak = QCheckBox("🔊 Auto-speak translations")
         self.auto_speak.setChecked(config.get("auto_speak", True))
         self.auto_speak.stateChanged.connect(lambda: config.set("auto_speak", self.auto_speak.isChecked()))
+        self.auto_speak.setToolTip("Automatically speak translated text using text-to-speech")
+        self.auto_speak.setStyleSheet("font-size: 13px; font-weight: 500;")
         controls_layout.addWidget(self.auto_speak, 2, 0, 1, 2)
         
-        self.show_conf = QCheckBox("Show confidence")
+        self.show_conf = QCheckBox("🎯 Show confidence scores")
         self.show_conf.setChecked(config.get("show_confidence", True))
         self.show_conf.stateChanged.connect(lambda: config.set("show_confidence", self.show_conf.isChecked()))
+        self.show_conf.setToolTip("Display confidence scores for speech recognition and translation")
+        self.show_conf.setStyleSheet("font-size: 13px; font-weight: 500;")
         controls_layout.addWidget(self.show_conf, 2, 2, 1, 2)
         
         main_layout.addWidget(controls)
         
-        # History
-        history_group = QGroupBox("📜 History (Throttled Refresh)")
+        # Professional history section
+        history_group = QGroupBox("📜 Translation History")
+        history_group.setToolTip("View, search, and export your translation history")
         history_layout = QVBoxLayout()
         
         history_controls = QHBoxLayout()
+        history_controls.setSpacing(10)
+        
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search...")
+        self.search_input.setPlaceholderText("🔍 Search translation history... (Ctrl+F)")
         self.search_input.textChanged.connect(self.search_history)
+        self.search_input.setToolTip("Search through your translation history by source or translated text")
+        self.search_input.setStyleSheet("padding: 10px; font-size: 13px;")
         history_controls.addWidget(self.search_input)
         
         self.export_btn = QPushButton("💾 Export")
         self.export_btn.clicked.connect(self.export_history)
+        self.export_btn.setToolTip("Export translation history to text file (Ctrl+E)")
+        self.export_btn.setStyleSheet("padding: 9px 16px; font-size: 13px; font-weight: 500;")
         history_controls.addWidget(self.export_btn)
         
         self.clear_btn = QPushButton("🗑️ Clear")
         self.clear_btn.clicked.connect(self.clear_history)
+        self.clear_btn.setToolTip("Clear all translation history (cannot be undone)")
+        self.clear_btn.setStyleSheet("padding: 9px 16px; font-size: 13px; font-weight: 500;")
         history_controls.addWidget(self.clear_btn)
         
         history_layout.addLayout(history_controls)
@@ -2020,77 +2330,143 @@ class LiveTranslatorApp(QMainWindow):
         history_group.setLayout(history_layout)
         main_layout.addWidget(history_group, 1)
         
-        self.statusBar().showMessage("Ready - Professional Edition v3.0")
+        self.statusBar().showMessage("🚀 Ready - Professional Edition v3.5 | Material Design 3 UI")
         self.refresh_history()
         self.setup_shortcuts()
     
     def setup_shortcuts(self):
+        """Setup professional keyboard shortcuts for accessibility"""
+        # Help and information
         QShortcut(QKeySequence("F1"), self, self.show_help)
+        QShortcut(QKeySequence("Ctrl+H"), self, self.show_help)
+        
+        # Main controls
         QShortcut(QKeySequence("Ctrl+L"), self, self.toggle_listening)
         QShortcut(QKeySequence("Ctrl+T"), self, self.translate_manual)
         QShortcut(QKeySequence("Ctrl+S"), self, self.speak_output)
         QShortcut(QKeySequence("Ctrl+O"), self, self.toggle_overlay)
         QShortcut(QKeySequence("Ctrl+D"), self, self.toggle_theme)
+        
+        # Advanced shortcuts for power users
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, self.show_settings)
+        QShortcut(QKeySequence("Ctrl+Shift+M"), self, self.show_models)
+        QShortcut(QKeySequence("Ctrl+E"), self, self.export_history)
+        QShortcut(QKeySequence("Ctrl+F"), self, self.focus_search)
+        QShortcut(QKeySequence("Ctrl+Shift+C"), self, self.clear_io_fields)
+        
+        # Application control
         QShortcut(QKeySequence("Ctrl+Q"), self, self.close)
+        QShortcut(QKeySequence("Alt+F4"), self, self.close)
+        
+        log.info("✅ Keyboard shortcuts configured for accessibility")
+    
+    def focus_search(self):
+        """Focus the search input for accessibility"""
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+    
+    def clear_io_fields(self):
+        """Clear input and output fields (Ctrl+Shift+C)"""
+        self.input_text.clear()
+        self.output_text.clear()
+        self.overlay.clear_subtitles()
+        self.statusBar().showMessage("✅ Cleared input/output fields", 2000)
     
     def show_help(self):
         help_text = f"""
-🎙️ Professional Edition v3.0 Features
+🌍 Universal Live Translator — Professional Edition v3.5
 
-✨ Continuous Listening
-- Microphone never stops - speak naturally
-- Async processing queue - no blocking
-- Parallel recognition and translation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📺 Google Live Captions-Style Overlay
-- Real-time word-by-word updates
-- Smooth scrolling transitions
-- Shows last 3 lines of text
-- Auto-wrapping at sentence breaks
-- Drag corners: Resize diagonally
-- Drag edges: Resize in one direction  
-- Drag center: Move window
+✨ CONTINUOUS LISTENING
+• Microphone never stops - speak naturally without interruptions
+• Async processing pipeline - zero blocking, maximum performance
+• Parallel recognition and translation for instant results
+• Real-time performance monitoring with queue status
 
-🚀 GPU Acceleration (Enhanced)
-- Current Status: {gpu_manager.device_name}
-- Device: {gpu_manager.device}
-- CUDA: {'✅ Available' if gpu_manager.has_cuda else '❌ Not detected'}
-- 10-20x faster Whisper transcription
-- Configure in Settings (⚙️)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📥 Model Management
-- Click 'Models' to download Whisper/Vosk models
-- Whisper: tiny, base, small, medium, large
-- Vosk: Offline speech recognition
+📺 NETFLIX/GOOGLE-STYLE OVERLAY
+• Real-time word-by-word subtitle updates
+• Professional glassmorphic design with blur effects
+• Smooth fade and scroll animations
+• Shows last {config.get("subtitle_lines", 3)} lines of text
+• Auto-wrapping at sentence breaks
 
-⚡ Keyboard Shortcuts
-- F1: This help
-- Ctrl+L: Toggle listening
-- Ctrl+T: Manual translate
-- Ctrl+S: Speak output
-- Ctrl+O: Toggle overlay
-- Ctrl+D: Toggle theme
-- Ctrl+Q: Quit
+Resizing Controls:
+  🔸 Drag corners → Resize diagonally
+  🔸 Drag edges → Resize in one direction
+  🔸 Drag center → Move window
+  🔸 Minimum size enforced for readability
 
-⚙️ Settings
-- All settings now editable in Settings dialog
-- Audio devices, GPU, models, theme, etc.
-- Changes apply immediately
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🔧 Latest Fixes & Improvements:
-- ✅ Enhanced system audio device detection with validation
-- ✅ Detailed error messages for audio device issues
-- ✅ Optimized subtitle overlay speed (configurable 1-100ms)
-- ✅ Faster word-by-word subtitle updates
-- ✅ Configurable subtitle lines and update delay
-- ✅ Improved loopback device fallback mechanism
-- ✅ Better error handling for PortAudio issues
-- ✅ Instant subtitle mode for ultra-responsive captions
+🚀 GPU ACCELERATION
+• Current Status: {gpu_manager.device_name}
+• Device: {gpu_manager.device.upper()}
+• CUDA: {'✅ Available' if gpu_manager.has_cuda else '❌ Not detected'}
+• MPS: {'✅ Available' if gpu_manager.has_mps else '❌ Not detected'}
+• Performance: 10-20x faster Whisper transcription
+• Configure in Settings (⚙️) for instant switching
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚡ KEYBOARD SHORTCUTS
+• F1 → Show this help
+• Ctrl+L → Start/stop continuous listening
+• Ctrl+T → Manual translate
+• Ctrl+S → Speak output
+• Ctrl+O → Toggle overlay
+• Ctrl+D → Toggle dark/light theme
+• Ctrl+Q → Quit application
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎨 PROFESSIONAL FEATURES
+• Material Design 3 UI with smooth animations
+• Netflix-level glassmorphic effects
+• Professional color palette and typography
+• Enhanced status indicators with real-time feedback
+• Accessible design with keyboard navigation
+• Smooth micro-interactions throughout
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📥 MODEL MANAGEMENT
+• Click 'Models' to download Whisper/Vosk models
+• Whisper: tiny, base, small, medium, large
+• Vosk: Offline speech recognition for 4+ languages
+• Auto-download on first use
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚙️ SETTINGS
+All settings editable via Settings dialog:
+• Appearance: Theme, fonts, colors, animations
+• Audio: TTS rate, volume, input devices
+• GPU & Models: Acceleration, Whisper model size
+• Cache: Translation caching, expiry settings
+• Overlay: Subtitle lines, update speed
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 PRO TIPS
+• Use GPU acceleration for 10-20x faster transcription
+• Set subtitle update delay to 5-10ms for instant captions
+• Enable translation caching for faster repeated phrases
+• Use 'base' Whisper model for best speed/accuracy balance
+• Resize overlay to fit your screen perfectly
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Enjoy your professional-grade translator! 🚀
 """
         msg = QMessageBox(self)
-        msg.setWindowTitle("Help - Professional Edition v3.0")
+        msg.setWindowTitle("✨ Help — Universal Live Translator v3.5")
         msg.setText(help_text)
         msg.setIcon(QMessageBox.Icon.Information)
+        # Set minimum width for better formatting
+        msg.setStyleSheet("QLabel{min-width: 650px; font-family: monospace;}")
         msg.exec()
     
     def populate_languages(self, combo, include_auto=False):
@@ -2123,12 +2499,33 @@ class LiveTranslatorApp(QMainWindow):
             QTimer.singleShot(500, self.start_listening)
     
     def on_gpu_toggled(self):
+        """Handle GPU acceleration toggle with professional feedback"""
         use_gpu = self.gpu_checkbox.isChecked()
         config.set("use_gpu", use_gpu)
         whisper_manager.set_device(use_gpu)
         device = whisper_manager.device
+        
+        # Update GPU status indicator with color coding
+        gpu_color = "#4CAF50" if use_gpu and gpu_manager.is_gpu_available() else "#FFC107"
+        gpu_bg = "rgba(76,175,80,0.15)" if use_gpu and gpu_manager.is_gpu_available() else "rgba(255,193,7,0.15)"
         self.gpu_status.setText(f"🚀 {device.upper()}")
-        self.statusBar().showMessage(f"GPU {'enabled' if use_gpu else 'disabled'} - using {device}", 3000)
+        self.gpu_status.setStyleSheet(f"""
+            QLabel {{
+                color: {gpu_color};
+                font-weight: 600;
+                font-size: 13px;
+                padding: 6px 12px;
+                background: {gpu_bg};
+                border-radius: 8px;
+                border: 1px solid {gpu_color};
+            }}
+        """)
+        
+        # Show professional status message
+        if use_gpu and gpu_manager.is_gpu_available():
+            self.statusBar().showMessage(f"✅ GPU acceleration ENABLED - Using {device.upper()} (10-20x faster!)", 4000)
+        else:
+            self.statusBar().showMessage(f"⚠️ GPU acceleration disabled - Using {device.upper()}", 4000)
     
     def show_models(self):
         dialog = ModelManagerDialog(self)
@@ -2157,13 +2554,22 @@ class LiveTranslatorApp(QMainWindow):
             self.statusBar().showMessage("Settings saved - Subtitle speed updated", 3000)
     
     def swap_languages(self):
+        """Swap source and target languages with validation"""
         if self.source_lang_combo.currentData() == "auto":
-            self.statusBar().showMessage("Cannot swap with auto-detect", 3000)
+            self.statusBar().showMessage("⚠️ Cannot swap with auto-detect enabled", 3000)
             return
+        
         src_idx = self.source_lang_combo.currentIndex()
         tgt_idx = self.target_lang_combo.currentIndex()
+        
+        # Swap the selections
         self.source_lang_combo.setCurrentIndex(tgt_idx + 1)
         self.target_lang_combo.setCurrentIndex(src_idx - 1)
+        
+        # Show confirmation
+        src_lang = self.source_lang_combo.currentText()
+        tgt_lang = self.target_lang_combo.currentText()
+        self.statusBar().showMessage(f"⇄ Languages swapped: {src_lang} → {tgt_lang}", 2000)
     
     def update_word_count(self):
         text = self.input_text.toPlainText()
@@ -2204,8 +2610,27 @@ class LiveTranslatorApp(QMainWindow):
         self.recognition_thread.start()
         
         self.listen_btn.setText("⏹️ Stop Continuous Listening")
-        self.listen_btn.setStyleSheet("background:#D32F2F;color:white;font-weight:bold;padding:12px;font-size:14px;")
-        self.statusBar().showMessage(f"🎙️ Continuous listening ({self.recognition_engine.value})...")
+        self.listen_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #F44336, stop:1 #D32F2F);
+                color: white;
+                font-weight: 600;
+                padding: 14px 24px;
+                font-size: 15px;
+                border: none;
+                border-radius: 12px;
+                letter-spacing: 0.5px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #FF5252, stop:1 #F44336);
+            }
+            QPushButton:pressed {
+                background: #B71C1C;
+            }
+        """)
+        self.statusBar().showMessage(f"🎙️ Continuous listening active ({self.recognition_engine.value} engine) - Speak naturally!")
     
     def stop_listening(self):
         if self.recognition_thread:
@@ -2213,14 +2638,38 @@ class LiveTranslatorApp(QMainWindow):
             self.recognition_thread.wait()
             self.recognition_thread = None
         self.listen_btn.setText("🎤 Start Continuous Listening")
-        self.listen_btn.setStyleSheet("font-weight:bold;padding:12px;font-size:14px;")
+        self.listen_btn.setStyleSheet("""
+            QPushButton {
+                font-weight: 600;
+                padding: 14px 24px;
+                font-size: 15px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4CAF50, stop:1 #388E3C);
+                color: white;
+                border: none;
+                border-radius: 12px;
+                letter-spacing: 0.5px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #5FD068, stop:1 #4CAF50);
+            }
+        """)
         self.statusBar().showMessage("Stopped")
         self.perf_label.setText("⚡ Performance: Idle")
     
     def toggle_source(self):
+        """Toggle audio source with professional feedback"""
         self.source_type = "system" if self.source_type == "microphone" else "microphone"
         self.source_btn.setText("🎤 Microphone" if self.source_type == "system" else "🎧 System Audio")
+        
+        # Show status update
+        source_name = "🎤 Microphone" if self.source_type == "microphone" else "🎧 System Audio"
+        self.statusBar().showMessage(f"⇄ Switched to {source_name}", 2000)
+        
+        # Restart listening if active
         if self.recognition_thread and self.recognition_thread.isRunning():
+            self.statusBar().showMessage(f"↻ Restarting with {source_name}...", 2000)
             self.stop_listening()
             QTimer.singleShot(500, self.start_listening)
     
@@ -2238,15 +2687,37 @@ class LiveTranslatorApp(QMainWindow):
         self.stop_listening()
     
     def update_performance(self, perf_data):
-        """Update performance indicators (called from signal, already thread-safe)"""
+        """Update professional performance indicators (called from signal, already thread-safe)"""
         avg_time = perf_data.get('avg_processing_time', 0)
         rec_queue = perf_data.get('recognition_queue', 0)
         trans_queue = perf_data.get('translation_queue', 0)
         device = perf_data.get('device', 'N/A')
         
+        # Color-coded performance indicator
+        if avg_time < 300:
+            color = "#4CAF50"  # Green - Excellent
+            status = "Excellent"
+        elif avg_time < 800:
+            color = "#FFC107"  # Yellow - Good
+            status = "Good"
+        else:
+            color = "#FF5722"  # Red - Slow
+            status = "Slow"
+        
         self.perf_label.setText(
-            f"⚡ {avg_time:.0f}ms | Q:{rec_queue}/{trans_queue} | {device}"
+            f"⚡ {avg_time:.0f}ms ({status}) | Queue: {rec_queue}/{trans_queue} | {device.upper()}"
         )
+        self.perf_label.setStyleSheet(f"""
+            QLabel {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {color};
+                padding: 6px 12px;
+                background: rgba({int(color[1:3], 16)},{int(color[3:5], 16)},{int(color[5:7], 16)},0.12);
+                border-radius: 8px;
+                border: 1px solid {color};
+            }}
+        """)
     
     def handle_phrase(self, phrase, confidence):
         if not phrase.strip():
@@ -2372,14 +2843,30 @@ class LiveTranslatorApp(QMainWindow):
         tts_manager.speak(text, lang)
     
     def copy_output(self):
+        """Copy output text to clipboard with professional feedback"""
         text = self.output_text.toPlainText()
+        if not text.strip():
+            self.statusBar().showMessage("⚠️ No text to copy", 2000)
+            return
+        
         import re
+        # Remove timestamps and confidence scores
         text = re.sub(r'\[.*?\]\s*', '', text)
         QApplication.clipboard().setText(text)
-        self.statusBar().showMessage("Copied!", 2000)
+        
+        # Show success message with character count
+        char_count = len(text)
+        word_count = len(text.split())
+        self.statusBar().showMessage(f"✅ Copied to clipboard! ({word_count} words, {char_count} characters)", 3000)
     
     def toggle_overlay(self):
-        self.overlay.setVisible(not self.overlay.isVisible())
+        """Toggle overlay visibility with status feedback"""
+        is_visible = not self.overlay.isVisible()
+        self.overlay.setVisible(is_visible)
+        config.set("overlay_visible", is_visible)
+        
+        status = "👁️ Overlay shown" if is_visible else "🚫 Overlay hidden"
+        self.statusBar().showMessage(status, 2000)
     
     def refresh_history_throttled(self):
         """Throttled history refresh to avoid UI lag"""
@@ -2425,123 +2912,283 @@ class LiveTranslatorApp(QMainWindow):
             self.output_text.setPlainText(data['translated_text'])
     
     def export_history(self):
+        """Export history with professional feedback and error handling"""
+        default_filename = f"translator_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Export", 
-            str(BASE_DIR / f"history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"), 
-            "Text Files (*.txt)"
+            self, 
+            "💾 Export Translation History", 
+            str(BASE_DIR / default_filename), 
+            "Text Files (*.txt);;All Files (*)"
         )
         if filename:
             try:
                 db.export_history(filename)
-                QMessageBox.information(self, "Success", f"Exported to:\n{filename}")
+                # Count exported items
+                with open(filename, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    count = len([l for l in lines if l.startswith('[')])
+                
+                QMessageBox.information(
+                    self, 
+                    "✅ Export Successful",
+                    f"Successfully exported {count} translations to:\n\n{filename}"
+                )
+                self.statusBar().showMessage(f"✅ Exported {count} translations", 3000)
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Export failed: {e}")
+                log.error(f"Export failed: {e}")
+                QMessageBox.critical(
+                    self, 
+                    "❌ Export Failed",
+                    f"Failed to export translation history:\n\n{str(e)}"
+                )
     
     def clear_history(self):
-        if QMessageBox.question(self, "Clear", "Clear all history?") == QMessageBox.StandardButton.Yes:
+        """Clear history with professional confirmation dialog"""
+        reply = QMessageBox.question(
+            self, 
+            "🗑️ Clear History",
+            "Are you sure you want to clear all translation history?\n\nThis action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
             db.clear_history()
             self.refresh_history()
+            self.statusBar().showMessage("✅ Translation history cleared", 3000)
     
     def toggle_theme(self):
+        """Toggle theme with smooth transition feedback"""
         current = config.get("theme", "dark")
         new = "light" if current == "dark" else "dark"
         config.set("theme", new)
         self.apply_theme(new)
+        
+        # Professional feedback
+        theme_name = "🌙 Dark Mode" if new == "dark" else "☀️ Light Mode"
+        self.statusBar().showMessage(f"✅ Switched to {theme_name}", 2000)
+        self.theme_btn.setText("☀️ Light" if new == "dark" else "🌙 Dark")
     
     def apply_theme(self, theme):
         if theme == "dark":
-            # Professional dark theme with glassmorphic elements
+            # Netflix/Google-level Material Design 3 dark theme
             self.setStyleSheet("""
                 QMainWindow, QWidget {
-                    background: #1a1a1a;
-                    color: #e0e0e0;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #0f0f14, stop:1 #1a1a20);
+                    color: #e8eaed;
+                    font-family: "Segoe UI", "SF Pro Display", -apple-system, system-ui, sans-serif;
                 }
                 QGroupBox {
-                    border: 2px solid #2d2d2d;
-                    border-radius: 12px;
-                    margin-top: 12px;
-                    padding-top: 18px;
+                    border: 1.5px solid rgba(255,255,255,0.08);
+                    border-radius: 16px;
+                    margin-top: 14px;
+                    padding-top: 22px;
                     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #252525, stop:1 #1f1f1f);
+                        stop:0 rgba(42,42,50,0.4), stop:1 rgba(32,32,38,0.4));
+                    font-size: 13px;
                 }
                 QGroupBox::title {
-                    left: 15px;
-                    padding: 0 10px;
-                    color: #64B5F6;
-                    font-weight: bold;
+                    left: 18px;
+                    padding: 0 12px;
+                    color: #82c8ff;
+                    font-weight: 600;
+                    font-size: 14px;
+                    letter-spacing: 0.5px;
                 }
                 QTextEdit, QListWidget, QLineEdit {
-                    background: #252525;
-                    border: 1px solid #3a3a3a;
-                    border-radius: 8px;
-                    padding: 10px;
-                    selection-background-color: #64B5F6;
+                    background: rgba(28,28,35,0.7);
+                    border: 1.5px solid rgba(255,255,255,0.06);
+                    border-radius: 12px;
+                    padding: 12px;
+                    selection-background-color: #82c8ff;
+                    selection-color: #0f0f14;
+                    font-size: 14px;
+                    line-height: 1.6;
+                }
+                QTextEdit:focus, QLineEdit:focus {
+                    border: 1.5px solid #82c8ff;
+                    background: rgba(28,28,35,0.85);
                 }
                 QPushButton {
                     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #3a3a3a, stop:1 #2d2d2d);
-                    border: 1px solid #4a4a4a;
-                    border-radius: 8px;
-                    padding: 10px 18px;
+                        stop:0 rgba(60,60,70,0.8), stop:1 rgba(45,45,55,0.8));
+                    border: 1.5px solid rgba(255,255,255,0.1);
+                    border-radius: 10px;
+                    padding: 11px 20px;
                     font-weight: 500;
+                    font-size: 13px;
+                    color: #e8eaed;
+                    letter-spacing: 0.3px;
                 }
                 QPushButton:hover {
                     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #4a4a4a, stop:1 #3d3d3d);
-                    border: 1px solid #64B5F6;
+                        stop:0 rgba(75,75,85,0.9), stop:1 rgba(60,60,70,0.9));
+                    border: 1.5px solid #82c8ff;
+                    transform: translateY(-1px);
                 }
                 QPushButton:pressed {
-                    background: #2d2d2d;
+                    background: rgba(45,45,55,0.95);
+                    border: 1.5px solid #5fa8d3;
+                    transform: translateY(0px);
                 }
                 QComboBox {
-                    background: #252525;
-                    border: 1px solid #3a3a3a;
-                    border-radius: 8px;
-                    padding: 8px;
+                    background: rgba(28,28,35,0.7);
+                    border: 1.5px solid rgba(255,255,255,0.06);
+                    border-radius: 10px;
+                    padding: 9px 12px;
+                    font-size: 13px;
+                    min-height: 20px;
                 }
                 QComboBox:hover {
-                    border: 1px solid #64B5F6;
+                    border: 1.5px solid #82c8ff;
+                    background: rgba(28,28,35,0.85);
+                }
+                QComboBox::drop-down {
+                    border: none;
+                    width: 30px;
+                }
+                QComboBox::down-arrow {
+                    image: none;
+                    border-left: 5px solid transparent;
+                    border-right: 5px solid transparent;
+                    border-top: 6px solid #82c8ff;
+                    margin-right: 8px;
                 }
                 QCheckBox {
-                    spacing: 8px;
+                    spacing: 10px;
+                    font-size: 13px;
                 }
                 QCheckBox::indicator {
-                    width: 18px;
-                    height: 18px;
-                    border-radius: 4px;
-                    border: 2px solid #3a3a3a;
-                    background: #252525;
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 6px;
+                    border: 2px solid rgba(255,255,255,0.15);
+                    background: rgba(28,28,35,0.7);
+                }
+                QCheckBox::indicator:hover {
+                    border: 2px solid #82c8ff;
+                    background: rgba(28,28,35,0.85);
                 }
                 QCheckBox::indicator:checked {
-                    background: #64B5F6;
-                    border-color: #64B5F6;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #82c8ff, stop:1 #5fa8d3);
+                    border-color: #82c8ff;
+                    image: none;
                 }
                 QStatusBar {
-                    background: #222;
-                    border-top: 1px solid #3a3a3a;
-                    color: #b0b0b0;
+                    background: rgba(20,20,26,0.95);
+                    border-top: 1.5px solid rgba(255,255,255,0.05);
+                    color: #b8bbbe;
+                    font-size: 12px;
+                    padding: 5px;
+                }
+                QLabel {
+                    color: #e8eaed;
+                    font-size: 13px;
+                }
+                QScrollBar:vertical {
+                    background: transparent;
+                    width: 12px;
+                    margin: 0;
+                }
+                QScrollBar::handle:vertical {
+                    background: rgba(130,200,255,0.3);
+                    border-radius: 6px;
+                    min-height: 30px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background: rgba(130,200,255,0.5);
+                }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    height: 0px;
                 }
             """)
         else:
-            # Light theme
+            # Netflix/Google-level Material Design 3 light theme
             self.setStyleSheet("""
                 QMainWindow, QWidget {
-                    background: #f5f5f5;
-                    color: #212121;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #fafafa, stop:1 #f0f0f5);
+                    color: #1f1f1f;
+                    font-family: "Segoe UI", "SF Pro Display", -apple-system, system-ui, sans-serif;
                 }
                 QGroupBox {
-                    border: 2px solid #e0e0e0;
+                    border: 1.5px solid rgba(0,0,0,0.06);
+                    border-radius: 16px;
+                    margin-top: 14px;
+                    padding-top: 22px;
+                    background: rgba(255,255,255,0.85);
+                    font-size: 13px;
+                }
+                QGroupBox::title {
+                    left: 18px;
+                    padding: 0 12px;
+                    color: #1967d2;
+                    font-weight: 600;
+                    font-size: 14px;
+                    letter-spacing: 0.5px;
+                }
+                QTextEdit, QListWidget, QLineEdit {
+                    background: rgba(255,255,255,0.9);
+                    border: 1.5px solid rgba(0,0,0,0.08);
                     border-radius: 12px;
+                    padding: 12px;
+                    selection-background-color: #1967d2;
+                    selection-color: white;
+                    font-size: 14px;
+                    line-height: 1.6;
+                }
+                QTextEdit:focus, QLineEdit:focus {
+                    border: 1.5px solid #1967d2;
                     background: white;
                 }
                 QPushButton {
-                    background: white;
-                    border: 1px solid #d0d0d0;
-                    border-radius: 8px;
-                    padding: 10px 18px;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 rgba(255,255,255,0.95), stop:1 rgba(245,245,250,0.95));
+                    border: 1.5px solid rgba(0,0,0,0.1);
+                    border-radius: 10px;
+                    padding: 11px 20px;
+                    font-weight: 500;
+                    font-size: 13px;
+                    color: #1f1f1f;
+                    letter-spacing: 0.3px;
                 }
                 QPushButton:hover {
-                    border: 1px solid #2196F3;
+                    background: white;
+                    border: 1.5px solid #1967d2;
+                    color: #1967d2;
+                }
+                QPushButton:pressed {
+                    background: rgba(245,245,250,1);
+                    border: 1.5px solid #1557b0;
+                }
+                QComboBox {
+                    background: rgba(255,255,255,0.9);
+                    border: 1.5px solid rgba(0,0,0,0.08);
+                    border-radius: 10px;
+                    padding: 9px 12px;
+                    font-size: 13px;
+                }
+                QComboBox:hover {
+                    border: 1.5px solid #1967d2;
+                    background: white;
+                }
+                QCheckBox::indicator {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 6px;
+                    border: 2px solid rgba(0,0,0,0.2);
+                    background: white;
+                }
+                QCheckBox::indicator:checked {
+                    background: #1967d2;
+                    border-color: #1967d2;
+                }
+                QStatusBar {
+                    background: rgba(245,245,250,0.95);
+                    border-top: 1.5px solid rgba(0,0,0,0.05);
+                    color: #5f6368;
+                    font-size: 12px;
                 }
             """)
         
@@ -2563,18 +3210,26 @@ class LiveTranslatorApp(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Universal Live Translator Pro v3.0")
+    app.setApplicationName("Universal Live Translator Pro v3.5")
     app.setStyle("Fusion")
     
-    log.info("="*60)
-    log.info("Universal Live Translator — Professional Edition v3.0")
-    log.info(f"Data: {BASE_DIR}")
-    log.info(f"GPU: {gpu_manager.device_name}")
-    log.info(f"Device: {gpu_manager.device}")
-    log.info("="*60)
+    log.info("="*70)
+    log.info("🌍 Universal Live Translator — Professional Edition v3.5")
+    log.info("="*70)
+    log.info(f"📁 Data Directory: {BASE_DIR}")
+    log.info(f"🚀 GPU Status: {gpu_manager.device_name}")
+    log.info(f"💻 Device: {gpu_manager.device.upper()}")
+    log.info(f"⚡ CUDA: {'Available' if gpu_manager.has_cuda else 'Not detected'}")
+    log.info(f"🍎 MPS: {'Available' if gpu_manager.has_mps else 'Not detected'}")
+    log.info(f"🎨 UI: Material Design 3 (Netflix/Google-level)")
+    log.info("="*70)
     
     window = LiveTranslatorApp()
     window.show()
+    
+    log.info("✅ Application started successfully")
+    log.info("💡 Press F1 for help and keyboard shortcuts")
+    
     sys.exit(app.exec())
 
 if __name__ == "__main__":
